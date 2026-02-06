@@ -21,6 +21,7 @@
 
 #include "hardware.h"
 #include "wivrn_discover.h"
+#include "wivrn_packets.h"
 
 #include <map>
 #include <mutex>
@@ -49,23 +50,18 @@ public:
 	std::map<std::string, server_data> servers;
 	std::optional<float> preferred_refresh_rate;
 	std::optional<float> minimum_refresh_rate;
-	float resolution_scale = 1.4;
+	float resolution_scale = 1.0;
+	std::optional<wivrn::video_codec> codec;
+	uint32_t bitrate_bps = 50'000'000;
+	uint8_t bit_depth = 10;
+
 	bool passthrough_enabled = false;
 	bool mic_unprocessed_audio = false;
 
 	bool fb_lower_body = false;
 	bool fb_hip = true;
 
-	// Snapdragon Game Super Resolution
-	struct sgsr_settings
-	{
-		bool enabled = false;
-		float upscaling_factor = 1.5;
-		bool use_edge_direction = true;
-		float edge_threshold = 4.0;
-		float edge_sharpness = 2.0;
-	};
-	sgsr_settings sgsr{};
+	bool enable_stream_gui = true;
 
 	// XR_FB_composition_layer_settings extension flags
 	struct openxr_post_processing_settings
@@ -77,11 +73,20 @@ public:
 
 	std::string virtual_keyboard_layout = "QWERTY";
 
+	std::string environment_model = "assets://ground.glb";
+
 	bool override_foveation_enable = false;
 	float override_foveation_pitch = 10 * M_PI / 180;
 	float override_foveation_distance = 3;
 
+	bool high_power_mode;
+
+	// Allow unsafe config values
+	bool extended_config = false;
+
 	bool first_run = true;
+
+	std::string locale;
 
 	bool check_feature(feature f) const;
 	void set_feature(feature f, bool state);
@@ -89,8 +94,8 @@ public:
 private:
 	mutable std::mutex mutex;
 	std::map<feature, bool> features;
+	std::optional<float> stream_scale;
 
-	void parse_sgsr_options(simdjson::simdjson_result<simdjson::dom::object> root);
 	void parse_openxr_post_processing_options(simdjson::simdjson_result<simdjson::dom::object> root);
 
 public:
@@ -98,4 +103,12 @@ public:
 	configuration() = default;
 
 	void save();
+
+	void set_stream_scale(float);
+	float get_stream_scale() const;
+
+	uint32_t max_bitrate() const
+	{
+		return extended_config ? 800'000'000u : 200'000'000u;
+	}
 };

@@ -38,10 +38,7 @@
 namespace wivrn
 {
 
-// Default port for server to listen, both TCP and UDP
-static const int default_port = 9757;
-
-static constexpr int protocol_revision = 2;
+static constexpr int protocol_revision = 0;
 
 enum class device_id : uint8_t
 {
@@ -168,6 +165,7 @@ enum video_codec
 	h265,
 	hevc = h265,
 	av1,
+	raw,
 };
 
 struct audio_data
@@ -213,16 +211,31 @@ struct visibility_mask_changed
 enum face_type : uint8_t
 {
 	none,
+	android,
 	fb2,
 	htc,
 };
 
+struct settings_changed
+{
+	float preferred_refresh_rate;
+	// for automatic
+	float minimum_refresh_rate;
+
+	uint32_t bitrate_bps;
+};
+
 struct headset_info_packet
 {
-	uint32_t recommended_eye_width;
-	uint32_t recommended_eye_height;
+	uint16_t render_eye_width;
+	uint16_t render_eye_height;
+	uint16_t stream_eye_width;
+	uint16_t stream_eye_height;
 	std::vector<float> available_refresh_rates;
-	float preferred_refresh_rate;
+
+	// runtime configurable settings
+	settings_changed settings;
+
 	struct audio_description
 	{
 		uint8_t num_channels;
@@ -234,11 +247,18 @@ struct headset_info_packet
 	bool hand_tracking;
 	bool eye_gaze;
 	bool palm_pose;
+	bool user_presence;
 	bool passthrough;
 	face_type face_tracking;
 	uint32_t num_generic_trackers;
 	std::vector<video_codec> supported_codecs; // from preferred to least preferred
+	std::optional<uint8_t> bit_depth;
 	std::string system_name;
+
+	// Used for the application list
+	std::string language;
+	std::string country;
+	std::string variant;
 };
 
 struct handshake
@@ -288,23 +308,36 @@ struct tracking
 	std::array<view, 2> views;
 	std::vector<pose> device_poses;
 
+	struct android_face
+	{
+		std::array<float, XR_FACE_PARAMETER_COUNT_ANDROID> parameters;
+		std::array<float, XR_FACE_REGION_CONFIDENCE_COUNT_ANDROID> confidences;
+		XrFaceTrackingStateANDROID state;
+		XrTime sample_time;
+		bool is_calibrated;
+		bool is_valid;
+	};
+
 	struct fb_face2
 	{
 		std::array<float, XR_FACE_EXPRESSION2_COUNT_FB> weights;
 		std::array<float, XR_FACE_CONFIDENCE2_COUNT_FB> confidences;
 		bool is_valid;
 		bool is_eye_following_blendshapes_valid;
+		XrTime time;
 	};
 
 	struct htc_face
 	{
+		XrTime eye_sample_time;
+		XrTime lip_sample_time;
 		std::array<float, XR_FACIAL_EXPRESSION_EYE_COUNT_HTC> eye;
 		std::array<float, XR_FACIAL_EXPRESSION_LIP_COUNT_HTC> lip;
 		bool eye_active;
 		bool lip_active;
 	};
 
-	std::variant<std::monostate, fb_face2, htc_face> face;
+	std::variant<std::monostate, android_face, fb_face2, htc_face> face;
 };
 
 struct trackings
@@ -387,6 +420,47 @@ struct inputs
 	std::vector<input_value> values;
 };
 
+struct hid
+{
+	struct button_down
+	{
+		uint8_t button;
+	};
+
+	struct button_up
+	{
+		uint8_t button;
+	};
+
+	struct mouse_move
+	{
+		float x;
+		float y;
+	};
+
+	struct mouse_scroll
+	{
+		float h;
+		float v;
+	};
+
+	struct key_down
+	{
+		uint8_t key;
+	};
+
+	struct key_up
+	{
+		uint8_t key;
+	};
+
+	using input_t = std::variant<button_down, button_up, mouse_move, mouse_scroll, key_down, key_up>;
+	struct input
+	{
+		input_t input_data;
+	};
+};
+
 struct timesync_response
 {
 	XrTime query;
@@ -455,11 +529,26 @@ struct start_app
 	std::string app_id;
 };
 
+struct get_running_applications
+{};
+
+struct set_active_application
+{
+	uint32_t id;
+};
+
+struct stop_application
+{
+	uint32_t id;
+};
+
+// when changing this, also make sure there are handlers in wivrn_session, etc. or compilation will fail
 using packets = std::variant<
         crypto_handshake,
         pin_check_1,
         pin_check_3,
         headset_info_packet,
+        settings_changed,
         feedback,
         audio_data,
         handshake,
@@ -477,7 +566,11 @@ using packets = std::variant<
         user_presence_changed,
         override_foveation_center,
         get_application_list,
-        start_app>;
+        start_app,
+        get_running_applications,
+        set_active_application,
+        hid::input,
+        stop_application>;
 } // namespace from_headset
 
 namespace to_headset
@@ -543,52 +636,27 @@ struct audio_stream_description
 
 struct video_stream_description
 {
-	enum class channels_t
-	{
-		colour,
-		alpha,
-	};
-	struct item
-	{
-		// useful dimensions of the video stream
-		uint16_t width;
-		uint16_t height;
-		// dimensions of the video, may include padding at the end
-		uint16_t video_width;
-		uint16_t video_height;
-		uint16_t offset_x;
-		uint16_t offset_y;
-		video_codec codec;
-		channels_t channels;
-		uint8_t subsampling; // applies to width/height only, offsets are in full size pixels
-		std::optional<VkSamplerYcbcrRange> range;
-		std::optional<VkSamplerYcbcrModelConversion> color_model;
-	};
+	// dimensions of the video stream per eye
+	// alpha is half resolution
 	uint16_t width;
 	uint16_t height;
+	std::array<video_codec, 3> codec; // left, right, alpha
 	float fps;
-	uint16_t defoveated_width;
-	uint16_t defoveated_height;
-	std::vector<item> items;
 };
 
 class video_stream_data_shard
 {
 public:
 	inline static const size_t max_payload_size = 1400;
-	enum flags : uint8_t
-	{
-		start_of_slice = 1,
-		end_of_slice = 1 << 1,
-		end_of_frame = 1 << 2,
-	};
-	// Identifier of stream in video_stream_description
+	// Identifier of stream:
+	// 0 left
+	// 1 right
+	// 2 alpha
 	uint8_t stream_item_idx;
 	// Counter increased for each frame
 	uint64_t frame_idx;
 	// Identifier of the shard within the frame
 	uint16_t shard_idx;
-	uint8_t flags;
 
 	// Position information, must be present on first video shard
 	struct view_info_t
@@ -651,6 +719,7 @@ struct tracking_control
 		right_hand,
 		face,
 		generic_tracker,
+		hid_input,
 		battery,
 		microphone,
 
@@ -675,7 +744,24 @@ struct application_list
 	{
 		std::string id;
 		std::string name;
-		std::vector<std::byte> image; // In PNG
+	};
+	std::vector<application> applications;
+};
+
+struct application_icon
+{
+	std::string id;
+	std::vector<std::byte> image; // In PNG
+};
+
+struct running_applications
+{
+	struct application
+	{
+		std::string name;
+		uint32_t id;
+		bool overlay;
+		bool active;
 	};
 	std::vector<application> applications;
 };
@@ -693,6 +779,8 @@ using packets = std::variant<
         timesync_query,
         tracking_control,
         refresh_rate_change,
-        application_list>;
+        application_list,
+        application_icon,
+        running_applications>;
 } // namespace to_headset
 } // namespace wivrn

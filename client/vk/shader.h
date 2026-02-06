@@ -19,12 +19,49 @@
 
 #pragma once
 
-#include <map>
 #include <string>
 #include <vector>
 #include <vulkan/vulkan_raii.hpp>
 
-extern const std::map<std::string, std::vector<uint32_t>> shaders;
+struct shader
+{
+	struct input
+	{
+		int location;
+		std::string name;
+		vk::Format format;
+		int array_size;
+	};
 
-vk::raii::ShaderModule load_shader(vk::raii::Device & device, const std::vector<uint32_t> & spirv);
-vk::raii::ShaderModule load_shader(vk::raii::Device & device, const std::string & name);
+	struct specialization_constant
+	{
+		int id;
+		std::string name;
+	};
+
+	vk::raii::ShaderModule shader_module;
+	std::vector<input> inputs;
+	std::vector<specialization_constant> specialization_constants;
+
+	vk::ShaderModule operator*() const
+	{
+		return *shader_module;
+	}
+
+	operator vk::ShaderModule() const
+	{
+		return *shader_module;
+	}
+};
+
+struct shader_loader
+{
+	vk::raii::Device & device;
+
+	shader_loader(vk::raii::Device & device);
+
+	std::shared_ptr<shader> operator()(std::span<const uint32_t> spirv);
+	std::shared_ptr<shader> operator()(const std::string & name);
+};
+
+std::shared_ptr<shader> load_shader(vk::raii::Device & device, const std::string & name);

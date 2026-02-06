@@ -20,12 +20,12 @@
 #pragma once
 
 #include "driver/clock_offset.h"
-#include "wivrn_config.h"
+#include "idr_handler.h"
 #include "wivrn_packets.h"
 
 #include <atomic>
-#include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <fstream>
 #include <memory>
@@ -44,6 +44,7 @@ inline const char * encoder_nvenc = "nvenc";
 inline const char * encoder_vaapi = "vaapi";
 inline const char * encoder_x264 = "x264";
 inline const char * encoder_vulkan = "vulkan";
+inline const char * encoder_raw = "raw";
 
 class video_encoder
 {
@@ -75,15 +76,19 @@ private:
 
 public:
 	const uint8_t stream_idx;
-	const to_headset::video_stream_description::channels_t channels;
 	static const uint8_t num_slots = 2;
 	const double bitrate_multiplier;
 
 private:
-	std::mutex mutex;
-	std::array<std::atomic<bool>, num_slots> busy = {false, false};
+	using state_t = std::atomic_unsigned_lock_free::value_type;
+	static const state_t idle = 0;
+	static const state_t busy = 1;
+	static const state_t skip = 2;
+	std::array<std::atomic_unsigned_lock_free, num_slots> state = {idle, idle};
 	uint8_t present_slot = 0;
 	uint8_t encode_slot = 0;
+
+	std::mutex mutex;
 
 	// temporary data
 	wivrn_session * cnx;
@@ -94,31 +99,23 @@ private:
 	to_headset::video_stream_data_shard::timing_info_t timing_info;
 	clock_offset clock;
 
-	std::atomic_bool sync_needed = true;
-	uint64_t last_idr_frame;
-
 	std::ofstream video_dump;
 
 	std::shared_ptr<sender> shared_sender;
 
 protected:
-	std::atomic_int pending_bitrate;
+	std::atomic_uint32_t pending_bitrate;
 	std::atomic<float> pending_framerate;
+	std::unique_ptr<idr_handler> idr;
+	const vk::Extent2D extent;
 
 public:
 	static std::unique_ptr<video_encoder> create(
 	        wivrn_vk_bundle &,
-	        encoder_settings & settings,
-	        uint8_t stream_idx,
-	        int input_width,
-	        int input_height,
-	        float fps);
+	        const encoder_settings & settings,
+	        uint8_t stream_idx);
 
-#if WIVRN_USE_VULKAN_ENCODE
-	static std::pair<std::vector<vk::VideoProfileInfoKHR>, vk::ImageUsageFlags> get_create_image_info(const std::vector<encoder_settings> &);
-#endif
-
-	video_encoder(uint8_t stream_idx, to_headset::video_stream_description::channels_t channels, double bitrate_multiplier, bool async_send);
+	video_encoder(uint8_t stream_idx, const encoder_settings & settings, std::unique_ptr<idr_handler>, bool async_send);
 	virtual ~video_encoder();
 
 	// return value: true if image should be transitioned to queue and layout for vulkan video encode
@@ -126,9 +123,10 @@ public:
 	std::pair<bool, vk::Semaphore> present_image(vk::Image y_cbcr, vk::raii::CommandBuffer & cmd_buf, uint64_t frame_index);
 	void post_submit();
 
-	virtual void on_feedback(const from_headset::feedback &);
-	virtual void reset();
-	void set_bitrate(int bitrate_bps);
+	void on_feedback(const from_headset::feedback &);
+	void reset();
+
+	void set_bitrate(uint32_t bitrate_bps);
 	void set_framerate(float framerate);
 
 	void encode(wivrn_session & cnx,
@@ -140,7 +138,7 @@ public:
 	// called after command buffer passed in present_image was submitted
 	virtual void post_submit(uint8_t slot) {}
 	// called when command buffer finished executing
-	virtual std::optional<data> encode(bool idr, std::chrono::steady_clock::time_point target_timestamp, uint8_t slot) = 0;
+	virtual std::optional<data> encode(uint8_t slot, uint64_t frame_index) = 0;
 
 	void SendData(std::span<uint8_t> data, bool end_of_frame, bool control = false);
 };

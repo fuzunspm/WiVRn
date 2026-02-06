@@ -41,14 +41,13 @@ xrt_result_t wivrn_hmd::get_visibility_mask(xrt_visibility_mask_type type, uint3
 {
 	static_assert(sizeof(uint32_t) == sizeof(decltype(from_headset::visibility_mask_changed::mask::indices)::value_type));
 	static_assert(sizeof(xrt_vec2) == sizeof(decltype(from_headset::visibility_mask_changed::mask::vertices)::value_type));
-	type = xrt_visibility_mask_type((unsigned int)type - 1); // enum values start at 1
 	const auto visibility_mask = this->visibility_mask.lock();
-	if (type >= from_headset::visibility_mask_changed::num_types or view_index >= 2 or not(*visibility_mask)[view_index])
+	if (type > from_headset::visibility_mask_changed::num_types or view_index >= 2 or not(*visibility_mask)[view_index])
 	{
 		*mask = (xrt_visibility_mask *)calloc(1, sizeof(xrt_visibility_mask));
 		return XRT_SUCCESS;
 	}
-	const auto & in_mask = (*(*visibility_mask)[view_index])[int(type)];
+	const auto & in_mask = (*(*visibility_mask)[view_index])[int(type - 1)];
 	size_t index_size = in_mask.indices.size() * sizeof(uint32_t);
 	size_t vertex_size = in_mask.vertices.size() * sizeof(xrt_vec2);
 	*mask = (xrt_visibility_mask *)calloc(1, sizeof(xrt_visibility_mask) + index_size + vertex_size);
@@ -76,7 +75,7 @@ wivrn_hmd::wivrn_hmd(wivrn::wivrn_session * cnx,
                 .supported = {
                         .orientation_tracking = true,
                         .position_tracking = true,
-                        .presence = true,
+                        .presence = info.user_presence,
                         .battery_status = true,
                 },
                 .update_inputs = [](xrt_device *) { return XRT_SUCCESS; },
@@ -91,9 +90,9 @@ wivrn_hmd::wivrn_hmd(wivrn::wivrn_session * cnx,
 {
 	const auto config = configuration();
 
-	auto eye_width = info.recommended_eye_width;
+	auto eye_width = info.render_eye_width;
 	eye_width = ((eye_width + 3) / 4) * 4;
-	auto eye_height = info.recommended_eye_height;
+	auto eye_height = info.render_eye_height;
 	eye_height = ((eye_height + 3) / 4) * 4;
 
 	// Setup info.
@@ -104,7 +103,7 @@ wivrn_hmd::wivrn_hmd(wivrn::wivrn_session * cnx,
 
 	hmd->distortion.models = XRT_DISTORTION_MODEL_NONE;
 	hmd->distortion.preferred = XRT_DISTORTION_MODEL_NONE;
-	hmd->screens[0].w_pixels = eye_width * 2;
+	hmd->screens[0].w_pixels = eye_width;
 	hmd->screens[0].h_pixels = eye_height;
 
 	// Left
@@ -158,6 +157,7 @@ xrt_result_t wivrn_hmd::get_presence(bool * out_presence)
 
 xrt_result_t wivrn_hmd::get_view_poses(const xrt_vec3 * default_eye_relation,
                                        int64_t at_timestamp_ns,
+                                       xrt_view_type view_type,
                                        uint32_t view_count,
                                        xrt_space_relation * out_head_relation,
                                        xrt_fov * out_fovs,
@@ -208,19 +208,17 @@ xrt_result_t wivrn_hmd::get_battery_status(bool * out_present,
 
 void wivrn_hmd::set_foveated_size(uint32_t width, uint32_t height)
 {
-	assert(width % 2 == 0);
-	uint32_t eye_width = width / 2;
-
 	hmd->screens[0].w_pixels = width;
 	hmd->screens[0].h_pixels = height;
 
 	for (int i = 0; i < 2; ++i)
 	{
 		auto & view = hmd->views[i];
-		view.viewport.x_pixels = i * eye_width;
+		// offset is only applicable for alpha channel
+		view.viewport.x_pixels = i * width;
 		view.viewport.y_pixels = 0;
 
-		view.viewport.w_pixels = eye_width;
+		view.viewport.w_pixels = width;
 		view.viewport.h_pixels = height;
 	}
 }
@@ -232,28 +230,13 @@ void wivrn_hmd::update_visibility_mask(const from_headset::visibility_mask_chang
 	m->at(mask.view_index) = mask.data;
 }
 
-bool wivrn_hmd::update_presence(bool new_presence, bool real)
+bool wivrn_hmd::update_presence(bool new_presence)
 {
-	// if this presence change comes from headset, always honor it,
-	// otherwise try to keep it in sync with the real presence,
-	// while still changing presence to false when session is not
-	// visible
-	if (real || new_presence == this->real_presence || !new_presence)
+	if (this->presence.exchange(new_presence) != new_presence)
 	{
-		if (real && this->real_presence != new_presence)
-		{
-			U_LOG_I("Updating real user presence: %s -> %s", real_presence ? "true" : "false", new_presence ? "true" : "false");
-			this->real_presence = new_presence;
-		}
-
-		if (this->presence == new_presence)
-			return false;
-
-		U_LOG_I("Updating user presence: %s -> %s", this->presence ? "true" : "false", new_presence ? "true" : "false");
-		this->presence = new_presence;
+		U_LOG_I("user presence changed to %s", new_presence ? "true" : "false");
 		return true;
 	}
-
 	return false;
 }
 } // namespace wivrn

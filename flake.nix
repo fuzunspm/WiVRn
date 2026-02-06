@@ -19,10 +19,28 @@
 
           pkgs.librsvg
           pkgs.libpng
+          pkgs.libarchive
+        ];
+        extraNativeBuildInputs = [
+          pkgs.util-linux
         ];
 
         package = pkgs.enableDebugging (pkgs.wivrn.overrideAttrs (finalAttrs: oldAttrs: {
-          src = ./.;
+          # Filter the directories and files we don't need to keep to avoid needless rebuilds
+          src = lib.cleanSourceWith {
+            filter = name: type: let
+              baseName = baseNameOf (toString name);
+            in
+            (lib.cleanSourceFilter name type) &&
+            !(
+              (type == "directory" && (
+                baseName == ".direnv"
+                || baseName == ".cxx"
+                || lib.hasPrefix "build" baseName))
+              || baseName == ".envrc"
+            );
+            src = ./.;
+          };
           version = "next";
 
           # Because src is just a folder path and not a set from a fetcher, it doesn't need to be unpacked, so having a postUnpack throws an error.
@@ -34,29 +52,18 @@
           monado = pkgs.applyPatches {
             inherit (oldAttrs.monado) patches postPatch;
             # Force a refetch when the monado rev changes.
-            src = pkgs.invalidateFetcherByDrvHash pkgs.fetchFromGitLab {
+            src = pkgs.testers.invalidateFetcherByDrvHash pkgs.fetchFromGitLab {
               inherit (oldAttrs.monado.src) owner repo;
               domain = "gitlab.freedesktop.org";
               # Keep in sync with CMakeLists.txt monado rev
-              rev = builtins.readFile ./monado-rev;
+              rev = lib.strings.trim (builtins.readFile ./monado-rev);
               # Nix will output the correct hash when it doesn't match
-              hash = "sha256-4P/ejRAitrYn8hXZPaDOcx27utfm+aVLjtqL6JxZYAg=";
+              hash = "sha256-zU8TLRzd4pb9KzVT/xana6rArcSu31wlCD54p7PJ9UY=";
             };
           };
 
           buildInputs = oldAttrs.buildInputs ++ extraBuildInputs;
-
-          dontWrapQtApps = true;
-
-          preFixup = ''
-            wrapQtApp "$out/bin/wivrn-dashboard" \
-              --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ pkgs.vulkan-loader ]}
-          '';
-          postFixup = null;
-
-          cmakeFlags = (oldAttrs.cmakeFlags or [ ]) ++ [
-            (lib.cmakeFeature "CMAKE_BUILD_TYPE" "Debug")
-          ];
+          nativeBuildInputs = oldAttrs.nativeBuildInputs ++ extraNativeBuildInputs;
         }));
       in {
         packages = {

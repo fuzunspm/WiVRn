@@ -23,124 +23,44 @@
 #include "android/battery.h"
 #endif
 #include "application.h"
-#include "asset.h"
 #include "configuration.h"
 #include "constants.h"
 #include "imgui.h"
-#include "imgui_internal.h"
 #include "lobby.h"
-#include "stream.h"
+#include "scenes/stream.h" // IWYU pragma: keep
+#include "utils/async.h"
 #include "utils/i18n.h"
+#include "utils/mapped_file.h"
 #include "utils/overloaded.h"
+#if WIVRN_CLIENT_DEBUG_MENU
 #include "utils/ranges.h"
+#endif
 #include "version.h"
+#include "xr/body_tracker.h"
 #include <algorithm>
 #include <cassert>
-#include <chrono>
+#include <chrono> // IWYU pragma: keep
+#include <entt/entity/fwd.hpp>
+#include <fastgltf/math.hpp>
+#include <fastgltf/types.hpp>
 #include <filesystem>
+#include <glm/geometric.hpp>
+#include <glm/gtc/matrix_access.hpp>
 #include <glm/gtc/quaternion.hpp>
+#include <imspinner.h>
+#include <magic_enum.hpp>
+#include <memory>
 #include <ranges>
 #include <spdlog/fmt/fmt.h>
 #include <string>
+#include <uni_algo/case.h>
 #include <utility>
 #include <utils/strings.h>
+#include <vulkan/vulkan_to_string.hpp>
 
 #include "IconsFontAwesome6.h"
 
 using namespace std::chrono_literals;
-
-// https://github.com/ocornut/imgui/issues/3379#issuecomment-2943903877
-static void ScrollWhenDragging()
-{
-	ImVec2 delta{0.0f, -ImGui::GetIO().MouseDelta.y};
-	const ImGuiMouseButton mouse_button = ImGuiMouseButton_Left;
-
-	ImGuiContext & g = *ImGui::GetCurrentContext();
-	ImGuiWindow * window = g.CurrentWindow;
-	ImGuiID id = window->GetID("##scrolldraggingoverlay");
-	ImGui::KeepAliveID(id);
-
-	static int active_id;
-	static ImVec2 cumulated_delta;
-
-	bool HoveredIdAllowOverlap_backup = std::exchange(g.HoveredIdAllowOverlap, true);
-	bool ActiveIdAllowOverlap_backup = std::exchange(g.ActiveIdAllowOverlap, true);
-	if (active_id == 0 and ImGui::ItemHoverable(window->Rect(), 0, g.CurrentItemFlags) and ImGui::IsMouseClicked(mouse_button, ImGuiInputFlags_None, /*id*/ ImGuiKeyOwner_Any))
-	{
-		active_id = id;
-
-		// Don't scroll on the first step, in case the active controller just changed
-		delta = {};
-		cumulated_delta = {};
-	}
-
-	if (not g.IO.MouseDown[mouse_button])
-		active_id = 0;
-
-	if (active_id == id)
-	{
-		if (delta.x != 0.0f)
-			ImGui::SetScrollX(window, window->Scroll.x + delta.x);
-		if (delta.y != 0.0f)
-			ImGui::SetScrollY(window, window->Scroll.y + delta.y);
-
-		cumulated_delta += delta;
-		if (std::max(std::abs(cumulated_delta.x), std::abs(cumulated_delta.y)) > 50)
-			ImGui::ClearActiveID();
-	}
-
-	g.HoveredIdAllowOverlap = HoveredIdAllowOverlap_backup;
-	g.ActiveIdAllowOverlap = ActiveIdAllowOverlap_backup;
-}
-
-static void CenterTextH(const std::string & text)
-{
-	float win_width = ImGui::GetWindowSize().x;
-	float text_width = ImGui::CalcTextSize(text.c_str()).x;
-	ImGui::SetCursorPosX((win_width - text_width) / 2);
-
-	ImGui::Text("%s", text.c_str());
-}
-
-static void CenterTextHV(const std::string & text)
-{
-	ImVec2 size = ImGui::GetWindowSize();
-
-	std::vector<std::string> lines = utils::split(text);
-
-	float text_height = 0;
-	for (const auto & i: lines)
-		text_height += ImGui::CalcTextSize(i.c_str()).y;
-
-	ImGui::SetCursorPosY((size.y - text_height) / 2);
-
-	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {0, 0});
-	for (const auto & i: lines)
-	{
-		float text_width = ImGui::CalcTextSize(i.c_str()).x;
-		ImGui::SetCursorPosX((size.x - text_width) / 2);
-		ImGui::Text("%s", i.c_str());
-	}
-	ImGui::PopStyleVar();
-}
-
-static void InputText(const char * label, std::string & text, const ImVec2 & size, ImGuiInputTextFlags flags)
-{
-	auto callback = [](ImGuiInputTextCallbackData * data) -> int {
-		std::string & text = *reinterpret_cast<std::string *>(data->UserData);
-
-		if (data->EventFlag == ImGuiInputTextFlags_CallbackResize)
-		{
-			assert(text.data() == data->Buf);
-			text.resize(data->BufTextLen);
-			data->Buf = text.data();
-		}
-
-		return 0;
-	};
-
-	ImGui::InputTextEx(label, nullptr, text.data(), text.size(), size, flags | ImGuiInputTextFlags_CallbackResize, callback, &text);
-}
 
 static void display_recentering_tip(imgui_context & ctx, const std::string & tip)
 {
@@ -170,54 +90,6 @@ static void display_recentering_tip(imgui_context & ctx, const std::string & tip
 	ImGui::End();
 	ImGui::PopStyleVar(2);
 	ImGui::PopFont();
-}
-
-// Display a button with an image and a text centred horizontally
-static bool icon(const std::string & text, ImTextureRef tex_ref, const ImVec2 & image_size, ImGuiButtonFlags flags = 0, const ImVec2 & size_arg = ImVec2(0, 0), const ImVec2 & uv0 = ImVec2(0, 0), const ImVec2 & uv1 = ImVec2(1, 1), const ImVec4 & tint_col = ImVec4(1, 1, 1, 1))
-{
-	// Based on ImGui::ButtonEx and ImGui::ImageButtonEx
-	ImGuiWindow * window = ImGui::GetCurrentWindow();
-	const ImGuiStyle & style = ImGui::GetStyle();
-
-	if (window->SkipItems)
-		return false;
-
-	const ImVec2 label_size = ImGui::CalcTextSize(text.c_str(), nullptr, true);
-
-	ImVec2 size = ImGui::CalcItemSize(
-	        size_arg,
-	        std::max(image_size.x, label_size.x) + style.FramePadding.x * 2.0f,
-	        image_size.y + style.ItemInnerSpacing.y + label_size.y + style.FramePadding.y * 2.0f);
-
-	const ImRect bb(window->DC.CursorPos, window->DC.CursorPos + size);
-
-	ImRect image_pos(
-	        {(bb.Min.x + bb.Max.x - image_size.x) / 2, bb.Min.y + style.FramePadding.y},
-	        {(bb.Min.x + bb.Max.x + image_size.x) / 2, bb.Min.y + style.FramePadding.y + image_size.y});
-
-	ImRect label_pos(
-	        {bb.Min.x + style.FramePadding.x, image_pos.Max.y + style.ItemInnerSpacing.y},
-	        {bb.Max.x - style.FramePadding.x, bb.Max.y - style.FramePadding.y});
-
-	ImGui::ItemSize(bb);
-
-	ImGuiID id = window->GetID(text.c_str());
-	if (!ImGui::ItemAdd(bb, id))
-		return false;
-
-	bool hovered, held;
-	bool pressed = ImGui::ButtonBehavior(bb, id, &hovered, &held, flags);
-
-	// Render
-	const ImU32 col = ImGui::GetColorU32((held && hovered) ? ImGuiCol_ButtonActive : hovered ? ImGuiCol_ButtonHovered
-	                                                                                         : ImGuiCol_Button);
-	ImGui::RenderNavCursor(bb, id);
-	ImGui::RenderFrame(bb.Min, bb.Max, col, true, style.FrameRounding);
-
-	window->DrawList->AddImage(tex_ref, image_pos.Min, image_pos.Max, uv0, uv1, ImGui::GetColorU32(tint_col));
-	ImGui::RenderTextClipped(label_pos.Min, label_pos.Max, text.c_str(), NULL, &label_size, style.ButtonTextAlign, &bb);
-
-	return pressed;
 }
 
 std::string openxr_post_processing_flag_name(XrCompositionLayerSettingsFlagsFB flag)
@@ -375,129 +247,19 @@ void scenes::lobby::gui_enter_pin(locked_notifiable<pin_request_data> & pin_requ
 	imgui_ctx->vibrate_on_hover();
 }
 
-void scenes::lobby::gui_connected()
+void scenes::lobby::gui_connected(XrTime predicted_display_time)
 {
 	if (not next_scene)
 	{
 		current_tab = tab::server_list;
-
-		for (const auto & [app_id, app_icon]: app_icons)
-			imgui_ctx->free_texture(app_icon);
-		app_icons.clear();
-
 		return;
 	}
 
-	ImGui::PushFont(nullptr, constants::gui::font_size_large);
-	if (server_name.empty())
-		CenterTextH(_("Connected to WiVRn server"));
-	else
-		CenterTextH(fmt::format(_F("Connected to {}"), server_name));
-	ImGui::PopFont();
-
-	auto disconnect = _("Disconnect");
-	auto disconnect_size = ImGui::CalcTextSize(disconnect.c_str());
-
-	auto apps = next_scene->get_applications();
-	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {20, 20});
-	if (apps->applications.empty())
-	{
-		CenterTextHV(_("Start an application on the server to start streaming."));
-	}
-	else
-	{
-		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {20, 0});
-		ImGui::BeginChild("Main", ImGui::GetWindowSize() - ImGui::GetCursorPos() - ImVec2(0, disconnect_size.y + 80), 0);
-
-		ImGui::Indent(20);
-		if (server_name.empty())
-			ImGui::Text("%s", _S("Start an application on your computer or select one to start streaming."));
-		else
-			ImGui::Text("%s", fmt::format(_F("Start an application on {} or select one to start streaming."), server_name).c_str());
-		ImGui::Unindent();
-
-		float icon_width = 400;
-		float icon_spacing = ImGui::GetStyle().ItemSpacing.x;
-		float usable_window_width = ImGui::GetWindowSize().x - ImGui::GetCurrentWindow()->ScrollbarSizes.x;
-
-		int icons_per_line = (usable_window_width + icon_spacing) / (icon_width + icon_spacing);
-		float icon_line_width = icons_per_line * icon_width + (icons_per_line - 1) * icon_spacing;
-
-		ImGui::Indent((usable_window_width - icon_line_width) / 2);
-
-		auto t0 = std::chrono::steady_clock::now();
-		for (const auto [index, app]: utils::enumerate(apps->applications))
-		{
-			ImTextureID texture = [&]() -> ImTextureID {
-				if (app.image.empty())
-					return default_icon;
-				else
-				{
-					auto it = app_icons.find(app.id);
-					if (it == app_icons.end())
-					{
-						// Don't load too many textures at the same time to keep the GUI responsive
-						if (std::chrono::steady_clock::now() - t0 > 10ms)
-							return default_icon;
-
-						try
-						{
-							it = app_icons.emplace(app.id, imgui_ctx->load_texture(app.image)).first;
-						}
-						catch (std::exception & e)
-						{
-							spdlog::warn("Unable to load icon for \"{}\": {}", app.id, e.what());
-
-							app.image.clear();
-							return default_icon;
-						}
-					}
-					return it->second;
-				}
-			}();
-
-			ImGui::PushStyleColor(ImGuiCol_Button, 0);
-			if (icon(app.name + "##" + app.id, texture, {256, 256}, 0, {icon_width, 0}))
-				next_scene->start_application(app.id);
-			imgui_ctx->vibrate_on_hover();
-			ImGui::PopStyleColor(); // ImGuiCol_Button
-
-			if (index % 3 != 2)
-				ImGui::SameLine();
-		}
-		ImGui::Unindent();
-
-		std::vector<std::pair<std::string, ImTextureID>> to_be_removed;
-		for (const auto & [app_id, app_icon]: app_icons)
-		{
-			if (not std::ranges::contains(apps->applications, app_id, &to_headset::application_list::application::id))
-				to_be_removed.emplace_back(app_id, app_icon);
-		}
-		for (const auto & [app_id, app_icon]: to_be_removed)
-		{
-			imgui_ctx->free_texture(app_icon);
-			app_icons.erase(app_id);
-		}
-
-		ScrollWhenDragging();
-		ImGui::EndChild();
-		ImGui::PopStyleVar(); // ImGuiStyleVar_WindowPadding
-	}
-	ImGui::PopStyleVar();
-
-	ImGui::SetCursorPosX(ImGui::GetWindowSize().x - disconnect_size.x - 50);
-	ImGui::SetCursorPosY(ImGui::GetWindowSize().y - disconnect_size.y - 50);
-
-	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 0.40f));
-	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.8f, 0.2f, 0.2f, 1.00f));
-	ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 0.1f, 0.1f, 1.00f));
-	if (ImGui::Button(disconnect.c_str()))
+	if (next_scene->apps.draw_gui(*imgui_ctx, _("Disconnect")) == app_launcher::Cancel)
 	{
 		next_scene.reset();
 		current_tab = tab::server_list;
 	}
-	imgui_ctx->vibrate_on_hover();
-	ImGui::PopStyleColor(3); // ImGuiCol_Button, ImGuiCol_ButtonHovered, ImGuiCol_ButtonActive
 }
 
 void scenes::lobby::gui_new_server()
@@ -510,43 +272,43 @@ void scenes::lobby::gui_new_server()
 	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {10, 10});
 	ImGui::Dummy({1000, 1});
 
-	ImGui::BeginTable("table", 2);
+	if (ImGui::BeginTable("table", 2))
+	{
+		ImGui::TableSetupColumn("Field name", ImGuiTableColumnFlags_WidthFixed);
+		ImGui::TableSetupColumn("Field value", ImGuiTableColumnFlags_WidthStretch);
 
-	ImGui::TableSetupColumn("Field name", ImGuiTableColumnFlags_WidthFixed);
-	ImGui::TableSetupColumn("Field value", ImGuiTableColumnFlags_WidthStretch);
+		ImGui::TableNextRow();
+		ImGui::TableNextColumn();
+		// Make sure the label is vertically centered wrt the text input
+		ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ImGui::GetStyle().FramePadding.y);
+		ImGui::Text("%s", _S("Name"));
 
-	ImGui::TableNextRow();
-	ImGui::TableNextColumn();
-	// Make sure the label is vertically centered wrt the text input
-	ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ImGui::GetStyle().FramePadding.y);
-	ImGui::Text("%s", _S("Name"));
+		ImGui::TableNextColumn();
+		if (ImGui::IsWindowAppearing())
+			ImGui::SetKeyboardFocusHere();
+		InputText("##Name", add_server_window_prettyname, {ImGui::GetContentRegionAvail().x, 0}, 0);
+		imgui_ctx->vibrate_on_hover();
 
-	ImGui::TableNextColumn();
-	if (ImGui::IsWindowAppearing())
-		ImGui::SetKeyboardFocusHere();
-	InputText("##Name", add_server_window_prettyname, {ImGui::GetContentRegionAvail().x, 0}, 0);
-	imgui_ctx->vibrate_on_hover();
+		ImGui::TableNextRow();
+		ImGui::TableNextColumn();
+		ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ImGui::GetStyle().FramePadding.y);
+		ImGui::Text("%s", _S("Address"));
 
-	ImGui::TableNextRow();
-	ImGui::TableNextColumn();
-	ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ImGui::GetStyle().FramePadding.y);
-	ImGui::Text("%s", _S("Address"));
+		ImGui::TableNextColumn();
+		InputText("##Hostname", add_server_window_hostname, {ImGui::GetContentRegionAvail().x, 0}, 0);
+		imgui_ctx->vibrate_on_hover();
 
-	ImGui::TableNextColumn();
-	InputText("##Hostname", add_server_window_hostname, {ImGui::GetContentRegionAvail().x, 0}, 0);
-	imgui_ctx->vibrate_on_hover();
+		ImGui::TableNextRow();
+		ImGui::TableNextColumn();
+		ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ImGui::GetStyle().FramePadding.y);
+		ImGui::Text("%s", _S("Port"));
 
-	ImGui::TableNextRow();
-	ImGui::TableNextColumn();
-	ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ImGui::GetStyle().FramePadding.y);
-	ImGui::Text("%s", _S("Port"));
+		ImGui::TableNextColumn();
+		ImGui::InputInt("##Port", &add_server_window_port, 1, 1, ImGuiInputTextFlags_CharsDecimal);
+		imgui_ctx->vibrate_on_hover();
 
-	ImGui::TableNextColumn();
-	ImGui::InputInt("##Port", &add_server_window_port, 1, 1, ImGuiInputTextFlags_CharsDecimal);
-	imgui_ctx->vibrate_on_hover();
-
-	ImGui::EndTable();
-
+		ImGui::EndTable();
+	}
 	ImGui::Checkbox(_S("TCP only"), &add_server_tcp_only);
 	imgui_ctx->vibrate_on_hover();
 
@@ -771,6 +533,44 @@ void scenes::lobby::gui_settings()
 
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(20, 20));
 
+	{
+		auto language_name = [&](const std::locale & loc = std::locale()) {
+			return boost::locale::pgettext("language selection, replace with the name of the language", "English", loc);
+		};
+		std::vector<std::tuple<std::string, std::locale, std::string>> languages;
+		for (const auto & msg_info: get_locales())
+		{
+			std::string code = msg_info.language;
+			if (not msg_info.country.empty())
+				code += "_" + msg_info.country;
+			std::locale loc(std::locale(), boost::locale::gnu_gettext::create_messages_facet<char>(msg_info));
+			languages.emplace_back(language_name(loc), loc, std::move(code));
+		}
+		std::ranges::sort(languages, [](auto & l, auto & r) {
+			return una::casesens::collate_utf8(std::get<0>(l), std::get<0>(r)) < 0;
+		});
+		if (ImGui::BeginCombo(_S("Language"), config.locale.empty() ? _S("System language") : language_name().c_str()))
+		{
+			if (ImGui::Selectable(_S("System language"), config.locale.empty(), ImGuiSelectableFlags_SelectOnRelease))
+			{
+				config.locale.clear();
+				config.save();
+				application::instance().load_locale();
+			}
+			for (const auto & [lang, locale, code]: languages)
+			{
+				if (ImGui::Selectable(lang.c_str(), code == config.locale, ImGuiSelectableFlags_SelectOnRelease))
+				{
+					config.locale = code;
+					config.save();
+					application::instance().load_locale();
+				}
+			}
+			ImGui::EndCombo();
+		}
+		imgui_ctx->vibrate_on_hover();
+	}
+
 	if (instance.has_extension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME))
 	{
 		const auto & refresh_rates = session.get_refresh_rates();
@@ -820,20 +620,46 @@ void scenes::lobby::gui_settings()
 		}
 	}
 
+	if (foveation)
+	{
+		std::array<const char *, 4> foveation_levels = {
+		        gettext_noop_context("Foveation level", "None"),
+		        gettext_noop_context("Foveation level", "Low"),
+		        gettext_noop_context("Foveation level", "Medium"),
+		        gettext_noop_context("Foveation level", "High"),
+		};
+
+		if (ImGui::BeginCombo(_S("Foveation level"), _cS("Foveation level", foveation_levels[(int)foveation->level()])))
+		{
+			for (int level = 0; level < foveation_levels.size(); level++)
+			{
+				if (ImGui::Selectable(_cS("Foveation level", foveation_levels[level]), (int)foveation->level() == level))
+				{
+					foveation = xr::foveation_profile{instance, session, (XrFoveationLevelFB)level, -10, false};
+					// TODO save in configuration
+				}
+			}
+
+			ImGui::EndCombo();
+		}
+		imgui_ctx->vibrate_on_hover();
+	}
+
+	// Render resolution
 	{
 		const auto current = config.resolution_scale;
 		const auto width = stream_view.recommendedImageRectWidth;
 		const auto height = stream_view.recommendedImageRectHeight;
-		auto intScale = int(current * 100);
+		auto intScale = int(current * 10);
 		const auto slider = ImGui::SliderInt(
-		        _("Resolution scale").append("##resolution_scale").c_str(),
+		        _("Render resolution").append("##resolution_scale").c_str(),
 		        &intScale,
-		        50,
-		        350,
-		        fmt::format(_F("%d%% - {}x{} per eye"), int(width * current), int(height * current)).c_str());
+		        5,
+		        config.extended_config ? 35 : 15,
+		        fmt::format(_F("{}%% - {}x{} per eye"), intScale * 10, int(width * current), int(height * current)).c_str());
 		if (slider)
 		{
-			config.resolution_scale = intScale * 0.01;
+			config.resolution_scale = intScale * 0.1;
 			config.save();
 		}
 		imgui_ctx->vibrate_on_hover();
@@ -843,6 +669,122 @@ void scenes::lobby::gui_settings()
 			ImGui::SameLine();
 			ImGui::Text("%s", fmt::format(_F("Resolution larger than {}x{} may not be supported by the headset"), stream_view.maxImageRectWidth, stream_view.maxImageRectHeight).c_str());
 		}
+	}
+
+	// foveation
+	{
+		const int step = 10;
+		const auto current = config.get_stream_scale();
+		int intval = round((1 - current) * 100 / step);
+		const auto slider = ImGui::SliderInt(
+		        _("Foveated encoding").append("##stream_scale").c_str(),
+		        &intval,
+		        0,
+		        100 / step,
+		        fmt::format(_F("{}%%"), intval * step).c_str());
+		if (slider)
+		{
+			// clamp out of the slider to have the 50% value centered
+			intval = std::clamp(intval,
+			                    config.extended_config ? 0 : 30 / step,
+			                    80 / step);
+			config.set_stream_scale(1 - intval * step * 0.01);
+			config.save();
+		}
+		if (ImGui::IsItemHovered())
+		{
+			if (config.check_feature(feature::eye_gaze))
+				imgui_ctx->tooltip(_("Higher values focus image quality where you look at,\n"
+				                     "improving latency, power efficiency and quality."));
+			else
+				imgui_ctx->tooltip(_("Higher values focus image quality at the center,\n"
+				                     "improving latency, power efficiency and quality."));
+		}
+		imgui_ctx->vibrate_on_hover();
+	}
+
+	{
+		auto codec_name = [](const std::optional<wivrn::video_codec> codec) {
+			if (not codec)
+				return _C("Codec", "Automatic");
+			switch (*codec)
+			{
+				case wivrn::h264:
+					return _C("Codec", "H.264");
+				case wivrn::h265:
+					return _C("Codec", "H.265");
+				case wivrn::av1:
+					return _C("Codec", "AV1");
+				case wivrn::raw:
+					break;
+			}
+			assert(false);
+			__builtin_unreachable();
+		};
+
+		if (ImGui::BeginCombo(_S("Codec"), codec_name(config.codec).c_str()))
+		{
+			if (ImGui::Selectable(codec_name({}).c_str(), not config.codec))
+			{
+				config.codec = std::nullopt;
+				config.save();
+			}
+			for (auto codec: supported_codecs)
+			{
+				// don't show raw in GUI
+				if (codec == wivrn::raw)
+					continue;
+
+				if (ImGui::Selectable(codec_name(codec).c_str(), config.codec == codec))
+				{
+					config.codec = codec;
+					config.save();
+				}
+			}
+
+			ImGui::EndCombo();
+		}
+		imgui_ctx->vibrate_on_hover();
+
+		if (config.codec == wivrn::video_codec::av1 or config.codec == wivrn::video_codec::h265)
+		{
+			ImGui::SameLine(0.f, 10.f);
+			bool ten_bit = config.bit_depth == 10;
+			if (ImGui::Checkbox(_S("10-bit"), &ten_bit))
+			{
+				config.bit_depth = ten_bit ? 10 : 8;
+				config.save();
+			}
+			imgui_ctx->vibrate_on_hover();
+		}
+	}
+
+	// Bitrate
+	{
+		const int mb = 1'000'000;
+		const auto current = config.bitrate_bps;
+		auto val = int(current / mb);
+		const auto slider = ImGui::SliderInt(
+		        _("Bitrate").append("##bitrate").c_str(),
+		        &val,
+		        1,
+		        config.max_bitrate() / mb,
+		        fmt::format(_F("{}Mbit/s"), val).c_str());
+		if (slider)
+		{
+			config.bitrate_bps = val * mb;
+			config.save();
+		}
+		imgui_ctx->vibrate_on_hover();
+	}
+
+	if (instance.has_extension(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME))
+	{
+		if (ImGui::Checkbox(_S("High power mode"), &config.high_power_mode))
+			config.save();
+		if (ImGui::IsItemHovered())
+			imgui_ctx->tooltip(_("Increase power usage to allow higher resolution and refresh rate"));
+		imgui_ctx->vibrate_on_hover();
 	}
 
 	{
@@ -866,8 +808,8 @@ void scenes::lobby::gui_settings()
 		ImGui::Unindent();
 		ImGui::EndDisabled();
 	}
+	if (system.hand_tracking_supported())
 	{
-		ImGui::BeginDisabled(not application::get_hand_tracking_supported());
 		bool enabled = config.check_feature(feature::hand_tracking);
 		if (ImGui::Checkbox(_S("Enable hand tracking"), &enabled))
 		{
@@ -876,10 +818,9 @@ void scenes::lobby::gui_settings()
 		imgui_ctx->vibrate_on_hover();
 		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) and (ImGui::GetItemFlags() & ImGuiItemFlags_Disabled))
 			imgui_ctx->tooltip(_("This feature is not supported by your headset"));
-		ImGui::EndDisabled();
 	}
+	if (application::get_eye_gaze_supported())
 	{
-		ImGui::BeginDisabled(not application::get_eye_gaze_supported());
 		bool enabled = config.check_feature(feature::eye_gaze);
 		if (ImGui::Checkbox(_S("Enable eye tracking"), &enabled))
 		{
@@ -888,29 +829,26 @@ void scenes::lobby::gui_settings()
 		imgui_ctx->vibrate_on_hover();
 		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) and (ImGui::GetItemFlags() & ImGuiItemFlags_Disabled))
 			imgui_ctx->tooltip(_("This feature is not supported by your headset"));
-		ImGui::EndDisabled();
 	}
+	if (system.face_tracker_supported() != xr::face_tracker_type::none)
 	{
-		ImGui::BeginDisabled(not application::get_face_tracking_supported());
 		bool enabled = config.check_feature(feature::face_tracking);
 		if (ImGui::Checkbox(_S("Enable face tracking"), &enabled))
 		{
 			config.set_feature(feature::face_tracking, enabled);
 		}
-		ImGui::EndDisabled();
 		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) and (ImGui::GetItemFlags() & ImGuiItemFlags_Disabled))
 			imgui_ctx->tooltip(_("This feature is not supported by your headset"));
 		imgui_ctx->vibrate_on_hover();
 	}
 
+	if (auto body_tracker = system.body_tracker_supported(); body_tracker != xr::body_tracker_type::none)
 	{
-		ImGui::BeginDisabled(not application::get_body_tracking_supported());
 		bool enabled = config.check_feature(feature::body_tracking);
 		if (ImGui::Checkbox(_S("Enable body tracking"), &enabled))
 		{
 			config.set_feature(feature::body_tracking, enabled);
 		}
-		ImGui::EndDisabled();
 		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
 		{
 			if (ImGui::GetItemFlags() & ImGuiItemFlags_Disabled)
@@ -919,54 +857,53 @@ void scenes::lobby::gui_settings()
 			}
 			else
 			{
-				std::visit(utils::overloaded{
-				                   [](auto &) {},
-				                   [this](xr::fb_body_tracker &) {
-					                   imgui_ctx->tooltip(_("Requires 'Hand and body tracking' to be enabled in the Quest movement tracking settings,\notherwise body data will be guessed from controller and headset positions"));
-				                   },
-				           },
-				           application::get_body_tracker());
+				if (body_tracker == xr::body_tracker_type::fb)
+					imgui_ctx->tooltip(_("Requires 'Hand and body tracking' to be enabled in the Quest movement tracking settings,\notherwise body data will be guessed from controller and headset positions"));
 			}
 		}
 
 		imgui_ctx->vibrate_on_hover();
-	}
-	if (std::holds_alternative<xr::fb_body_tracker>(application::get_body_tracker()))
-	{
-		ImGui::BeginDisabled(not config.check_feature(feature::body_tracking));
-		ImGui::Indent();
-		if (ImGui::Checkbox(_S("Enable lower body tracking"), &config.fb_lower_body))
+
+		if (body_tracker == xr::body_tracker_type::fb)
 		{
-			config.save();
+			ImGui::BeginDisabled(not config.check_feature(feature::body_tracking));
+			ImGui::Indent();
+			if (ImGui::Checkbox(_S("Enable lower body tracking"), &config.fb_lower_body))
+			{
+				config.save();
+			}
+			imgui_ctx->vibrate_on_hover();
+			if (ImGui::IsItemHovered())
+				imgui_ctx->tooltip(_("Estimate lower body joint positions using Generative Legs\nRequires 'Hand and body tracking' to be enabled in the Quest movement tracking settings"));
+
+			ImGui::BeginDisabled(not config.fb_lower_body);
+			if (ImGui::Checkbox(_S("Enable hip tracking"), &config.fb_hip))
+			{
+				config.save();
+			}
+			imgui_ctx->vibrate_on_hover();
+			if (ImGui::IsItemHovered())
+				imgui_ctx->tooltip(_("Only takes affect with lower body tracking enabled\nMay be desired when using another source of hip tracking"));
+			ImGui::EndDisabled();
+
+			ImGui::Unindent();
+			ImGui::EndDisabled();
 		}
+	}
+
+	{
+		ImGui::Checkbox(_S("Enable in-stream window"), &config.enable_stream_gui);
 		imgui_ctx->vibrate_on_hover();
 		if (ImGui::IsItemHovered())
-			imgui_ctx->tooltip(_("Estimate lower body joint positions using Generative Legs\nRequires 'Hand and body tracking' to be enabled in the Quest movement tracking settings"));
+			imgui_ctx->tooltip(_("Enables the configuration window to be shown while the game is streaming.\nIf enabled, the window is activated by pressing both thumbsticks."));
+	}
 
-		ImGui::BeginDisabled(not config.fb_lower_body);
-		if (ImGui::Checkbox(_S("Enable hip tracking"), &config.fb_hip))
-		{
-			config.save();
-		}
+	{
+		ImGui::Checkbox(_S("Extended configuration values"), &config.extended_config);
 		imgui_ctx->vibrate_on_hover();
 		if (ImGui::IsItemHovered())
-			imgui_ctx->tooltip(_("Only takes affect with lower body tracking enabled\nMay be desired when using another source of hip tracking"));
-		ImGui::EndDisabled();
-
-		ImGui::Unindent();
-		ImGui::EndDisabled();
+			imgui_ctx->tooltip(_("Allows unsafe configuration values, use at your own risk."));
 	}
-
-	ImGui::BeginDisabled(passthrough_supported == xr::system::passthrough_type::no_passthrough);
-	if (ImGui::Checkbox(_S("Enable video passthrough in lobby"), &config.passthrough_enabled))
-	{
-		setup_passthrough();
-		config.save();
-	}
-	imgui_ctx->vibrate_on_hover();
-	if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) and (ImGui::GetItemFlags() & ImGuiItemFlags_Disabled))
-		imgui_ctx->tooltip(_("This feature is not supported by your headset"));
-	ImGui::EndDisabled();
 
 	ImGui::PopStyleVar(); // ImGuiStyleVar_ItemSpacing
 }
@@ -1034,214 +971,240 @@ void scenes::lobby::gui_post_processing()
 		ImGui::Unindent();
 	}
 
-	{
-		// SGSR
-		{
-			if (ImGui::Checkbox(_S("Enable Snapdragon Game Super Resolution"), &config.sgsr.enabled))
-			{
-				config.save();
-			}
-			imgui_ctx->vibrate_on_hover();
-			if (ImGui::IsItemHovered())
-			{
-				if (application::get_openxr_post_processing_supported())
-					imgui_ctx->tooltip(_("On this headset, this setting has been fully superseded by the native Sharpening setting above.\nOnly enable if you know what you're doing."));
-				else
-					imgui_ctx->tooltip(_("Client-side upscaling and sharpening, adds a performance cost on the headset"));
-			}
-			if (application::get_openxr_post_processing_supported())
-			{
-				ImGui::SameLine();
-				ImGui::TextColored(ImColor(0xf9, 0x73, 0x06) /*orange*/, ICON_FA_TRIANGLE_EXCLAMATION);
-			}
-		}
-
-		{
-			ImGui::BeginDisabled(not config.sgsr.enabled);
-			ImGui::Indent();
-			{
-				const auto current = config.sgsr.upscaling_factor;
-				const auto width = stream_view.recommendedImageRectWidth * config.resolution_scale;
-				const auto height = stream_view.recommendedImageRectHeight * config.resolution_scale;
-				auto intScale = int(current * 100);
-				const auto slider = ImGui::SliderInt(
-				        _("Upscaling factor").append("##upscaling_factor").c_str(),
-				        &intScale,
-				        100,
-				        200,
-				        fmt::format(_F("%d%% - {}x{} per eye"), int(width * current), int(height * current)).c_str());
-				if (slider)
-				{
-					config.sgsr.upscaling_factor = intScale * 0.01;
-					config.save();
-				}
-				imgui_ctx->vibrate_on_hover();
-				if (width * current > stream_view.maxImageRectWidth or height * current > stream_view.maxImageRectHeight)
-				{
-					ImGui::TextColored(ImColor(0xf9, 0x73, 0x06) /*orange*/, ICON_FA_TRIANGLE_EXCLAMATION);
-					ImGui::SameLine();
-					ImGui::Text("%s", fmt::format(_F("Resolution larger than {}x{} may not be supported by the headset"), stream_view.maxImageRectWidth, stream_view.maxImageRectHeight).c_str());
-				}
-			}
-			{
-				if (ImGui::Checkbox(_S("Use edge direction"), &config.sgsr.use_edge_direction))
-				{
-					config.save();
-				}
-				imgui_ctx->vibrate_on_hover();
-				if (ImGui::IsItemHovered())
-					imgui_ctx->tooltip(_("Adds an additional performance cost"));
-			}
-			{
-				const float current = config.sgsr.edge_threshold;
-				int intScale = int(current);
-				if (ImGui::SliderInt(_S("Edge threshold"), &intScale, 1, 16, "%d.0"))
-				{
-					config.sgsr.edge_threshold = float(intScale);
-					config.save();
-				}
-				imgui_ctx->vibrate_on_hover();
-				if (ImGui::IsItemHovered())
-					imgui_ctx->tooltip(fmt::format(_F("Recommended: {:.1f}"), 4.0));
-			}
-			{
-				if (ImGui::SliderFloat(_S("Edge sharpness"), &config.sgsr.edge_sharpness, 1.0, 2.0, "%.2f"))
-				{
-					config.save();
-				}
-				imgui_ctx->vibrate_on_hover();
-				if (ImGui::IsItemHovered())
-					imgui_ctx->tooltip(fmt::format(_F("Recommended: {:.1f}"), 2.0));
-			}
-			ImGui::Unindent();
-			ImGui::EndDisabled();
-		}
-	}
 	ImGui::PopStyleVar();
 }
 
 #if WIVRN_CLIENT_DEBUG_MENU
+void scenes::lobby::gui_debug_node_hierarchy(entt::entity root)
+{
+	for (auto && [entity, node]: world.view<components::node>().each())
+	{
+		if (node.parent != root)
+			continue;
+
+		std::string id = "entity-" + std::to_string((int)entity);
+		const std::string & name = node.name == "" ? id : node.name;
+
+		// See ImGui::StyleColorsDark
+		if (node.global_visible)
+			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.00f, 1.00f, 1.00f, 1.00f));
+		else
+			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.50f, 0.50f, 0.50f, 1.00f));
+
+		ImGui::TableNextRow();
+		ImGui::TableNextColumn();
+		if (ImGui::TreeNodeEx(id.c_str(), ImGuiTreeNodeFlags_None, "%s", name.c_str()))
+		{
+			glm::vec3 scale{
+			        glm::length(glm::column(node.transform_to_root, 0)),
+			        glm::length(glm::column(node.transform_to_root, 1)),
+			        glm::length(glm::column(node.transform_to_root, 2)),
+			};
+
+			gui_debug_node_hierarchy(entity);
+
+			if (node.mesh)
+				for (auto [index, primitive]: utils::enumerate(node.mesh->primitives))
+				{
+					ImGui::TableNextRow();
+					ImGui::TableNextColumn();
+					std::string name = "Primitive " + std::to_string(index + 1);
+
+					ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf;
+					if (debug_primitive_to_highlight == std::pair{entity, index})
+						flags |= ImGuiTreeNodeFlags_Selected;
+
+					if (ImGui::TreeNodeEx(name.c_str(), flags))
+					{
+						if (ImGui::IsItemClicked())
+							debug_primitive_to_highlight = {entity, index};
+
+						if (ImGui::IsItemHovered())
+						{
+							std::string tooltip = fmt::format(
+							        "Name: {}\n"
+							        "Topology: {}\n"
+							        "Vertices: {}\n"
+							        "Material: {}\n"
+							        "vertex shader: {}\n"
+							        "Fragment shader: {}\n",
+							        name,
+							        vk::to_string(primitive.topology),
+							        primitive.vertex_count,
+							        primitive.material_->name,
+							        primitive.vertex_shader,
+							        primitive.material_->fragment_shader_name);
+
+							imgui_ctx->tooltip(tooltip);
+						}
+
+						ImGui::TreePop();
+					}
+
+					ImGui::TableNextColumn();
+
+					glm::vec3 size = scale * (primitive.obb_max - primitive.obb_min);
+					ImGui::Text("%s", fmt::format("{} vertices, {:.3f} x {:.3f} x {:.3f} m", primitive.vertex_count, size.x, size.y, size.z).c_str());
+				}
+
+			ImGui::TreePop();
+		}
+		ImGui::TableNextRow();
+		ImGui::PopStyleColor(); // ImGuiCol_Text
+	}
+}
+
 void scenes::lobby::gui_debug()
 {
 	ImGui::GetIO().ConfigDragClickToInputText = true;
 
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(20, 20));
 
-	ImGui::Checkbox("Display debug axes", &display_debug_axes);
-	imgui_ctx->vibrate_on_hover();
-
-	if (display_debug_axes)
+	if (ImGui::CollapsingHeader("Tune controller offset"))
 	{
-		ImGui::Checkbox("Display grip instead of aim", &display_grip_instead_of_aim);
+		imgui_ctx->vibrate_on_hover();
+		ImGui::Checkbox("Display debug axes", &display_debug_axes);
+		imgui_ctx->vibrate_on_hover();
+
+		if (display_debug_axes)
+		{
+			ImGui::Checkbox("Display grip instead of aim", &display_grip_instead_of_aim);
+			imgui_ctx->vibrate_on_hover();
+		}
+
+		ImGui::SetNextItemWidth(140);
+		ImGui::DragFloat("##offset x", &offset_position.x, 0.0001);
+		imgui_ctx->vibrate_on_hover();
+
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(140);
+		ImGui::DragFloat("##offset y", &offset_position.y, 0.0001);
+		imgui_ctx->vibrate_on_hover();
+
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(140);
+		ImGui::DragFloat("Position", &offset_position.z, 0.0001);
+		imgui_ctx->vibrate_on_hover();
+
+		ImGui::SameLine();
+		if (ImGui::Button("Reset##position"))
+			offset_position = {0, 0, 0};
+		imgui_ctx->vibrate_on_hover();
+
+		ImGui::SetNextItemWidth(140);
+		ImGui::DragFloat("##offset roll", &offset_orientation.x, 0.01);
+		imgui_ctx->vibrate_on_hover();
+
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(140);
+		ImGui::DragFloat("##offset pitch", &offset_orientation.y, 0.01);
+		imgui_ctx->vibrate_on_hover();
+
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(140);
+		ImGui::DragFloat("Rotation", &offset_orientation.z, 0.01);
+		imgui_ctx->vibrate_on_hover();
+
+		ImGui::SameLine();
+		if (ImGui::Button("Reset##orientation"))
+			offset_orientation = {0, 0, 0};
+		imgui_ctx->vibrate_on_hover();
+
+		ImGui::SetNextItemWidth(140);
+		ImGui::DragFloat("Ray offset", &ray_offset, 0.0001);
 		imgui_ctx->vibrate_on_hover();
 	}
-
-	ImGui::SetNextItemWidth(140);
-	ImGui::DragFloat("##offset x", &offset_position.x, 0.0001);
-	imgui_ctx->vibrate_on_hover();
-
-	ImGui::SameLine();
-	ImGui::SetNextItemWidth(140);
-	ImGui::DragFloat("##offset y", &offset_position.y, 0.0001);
-	imgui_ctx->vibrate_on_hover();
-
-	ImGui::SameLine();
-	ImGui::SetNextItemWidth(140);
-	ImGui::DragFloat("Position", &offset_position.z, 0.0001);
-	imgui_ctx->vibrate_on_hover();
-
-	ImGui::SameLine();
-	if (ImGui::Button("Reset##position"))
-		offset_position = {0, 0, 0};
-	imgui_ctx->vibrate_on_hover();
-
-	ImGui::SetNextItemWidth(140);
-	ImGui::DragFloat("##offset roll", &offset_orientation.x, 0.01);
-	imgui_ctx->vibrate_on_hover();
-
-	ImGui::SameLine();
-	ImGui::SetNextItemWidth(140);
-	ImGui::DragFloat("##offset pitch", &offset_orientation.y, 0.01);
-	imgui_ctx->vibrate_on_hover();
-
-	ImGui::SameLine();
-	ImGui::SetNextItemWidth(140);
-	ImGui::DragFloat("Rotation", &offset_orientation.z, 0.01);
-	imgui_ctx->vibrate_on_hover();
-
-	ImGui::SameLine();
-	if (ImGui::Button("Reset##orientation"))
-		offset_orientation = {0, 0, 0};
-	imgui_ctx->vibrate_on_hover();
-
-	ImGui::SetNextItemWidth(140);
-	ImGui::DragFloat("Ray offset", &ray_offset, 0.0001);
-	imgui_ctx->vibrate_on_hover();
+	else
+		imgui_ctx->vibrate_on_hover();
 
 	if (ImGui::Button("Delete configuration file"))
 		std::filesystem::remove(application::get_config_path() / "client.json");
 	imgui_ctx->vibrate_on_hover();
 
-	float win_width = ImGui::GetWindowSize().x;
-	float win_height = ImGui::GetWindowSize().y;
-
-	ImGuiStyle & style = ImGui::GetStyle();
-	ImVec2 plot_size{
-	        win_width / 2 - style.ItemSpacing.x / 2,
-	        win_height / 2};
-
-	static std::array<float, 300> cpu_time;
-	static std::array<float, 300> gpu_time;
-	static int offset = 0;
-
-	float min_v = 0;
-	float max_v = 20;
-
-	cpu_time[offset] = application::get_cpu_time().count() * 1.0e-6;
-	gpu_time[offset] = renderer->get_gpu_time() * 1'000;
-	offset = (offset + 1) % cpu_time.size();
-
-	ImPlot::PushStyleColor(ImPlotCol_PlotBg, IM_COL32(32, 32, 32, 64));
-	ImPlot::PushStyleColor(ImPlotCol_FrameBg, IM_COL32(0, 0, 0, 0));
-	ImPlot::PushStyleColor(ImPlotCol_AxisBg, IM_COL32(0, 0, 0, 0));
-	ImPlot::PushStyleColor(ImPlotCol_AxisBgActive, IM_COL32(0, 0, 0, 0));
-	ImPlot::PushStyleColor(ImPlotCol_AxisBgHovered, IM_COL32(0, 0, 0, 0));
-
-	if (ImPlot::BeginPlot(_S("CPU time"), plot_size, ImPlotFlags_CanvasOnly))
+	if (ImGui::CollapsingHeader("CPU / GPU stats"))
 	{
-		auto col = ImPlot::GetColormapColor(0);
+		imgui_ctx->vibrate_on_hover();
+		float win_width = ImGui::GetWindowSize().x;
+		float win_height = ImGui::GetWindowSize().y;
 
-		ImPlot::SetupAxes(nullptr, _S("CPU time [ms]"), ImPlotAxisFlags_NoDecorations, 0);
-		ImPlot::SetupAxesLimits(0, cpu_time.size() - 1, min_v, max_v, ImGuiCond_Always);
-		ImPlot::SetNextLineStyle(col);
-		ImPlot::SetNextFillStyle(col, 0.25);
-		ImPlot::PlotLine(_S("CPU time"), cpu_time.data(), cpu_time.size(), 1, 0, ImPlotLineFlags_Shaded, offset);
-		ImPlot::EndPlot();
+		ImGuiStyle & style = ImGui::GetStyle();
+		ImVec2 plot_size{
+		        win_width / 2 - style.ItemSpacing.x / 2,
+		        win_height / 2};
+
+		static std::array<float, 300> cpu_time;
+		static std::array<float, 300> gpu_time;
+		static int offset = 0;
+
+		float min_v = 0;
+		float max_v = 20;
+
+		cpu_time[offset] = application::get_cpu_time().count() * 1.0e-6;
+		gpu_time[offset] = renderer->get_gpu_time() * 1'000;
+		offset = (offset + 1) % cpu_time.size();
+
+		ImPlot::PushStyleColor(ImPlotCol_PlotBg, IM_COL32(32, 32, 32, 64));
+		ImPlot::PushStyleColor(ImPlotCol_FrameBg, IM_COL32(0, 0, 0, 0));
+		ImPlot::PushStyleColor(ImPlotCol_AxisBg, IM_COL32(0, 0, 0, 0));
+		ImPlot::PushStyleColor(ImPlotCol_AxisBgActive, IM_COL32(0, 0, 0, 0));
+		ImPlot::PushStyleColor(ImPlotCol_AxisBgHovered, IM_COL32(0, 0, 0, 0));
+
+		if (ImPlot::BeginPlot(_S("CPU time"), plot_size, ImPlotFlags_CanvasOnly))
+		{
+			auto col = ImPlot::GetColormapColor(0);
+
+			ImPlot::SetupAxes(nullptr, _S("CPU time [ms]"), ImPlotAxisFlags_NoDecorations, 0);
+			ImPlot::SetupAxesLimits(0, cpu_time.size() - 1, min_v, max_v, ImGuiCond_Always);
+			ImPlot::SetNextLineStyle(col);
+			ImPlot::SetNextFillStyle(col, 0.25);
+			ImPlot::PlotLine(_S("CPU time"), cpu_time.data(), cpu_time.size(), 1, 0, ImPlotLineFlags_Shaded, offset);
+			ImPlot::EndPlot();
+		}
+
+		ImGui::SameLine();
+
+		if (ImPlot::BeginPlot(_S("GPU time"), plot_size, ImPlotFlags_CanvasOnly))
+		{
+			auto col = ImPlot::GetColormapColor(1);
+
+			ImPlot::SetupAxes(nullptr, _S("GPU time [ms]"), ImPlotAxisFlags_NoDecorations, 0);
+			ImPlot::SetupAxesLimits(0, gpu_time.size() - 1, min_v, max_v, ImGuiCond_Always);
+			ImPlot::SetNextLineStyle(col);
+			ImPlot::SetNextFillStyle(col, 0.25);
+			ImPlot::PlotLine(_S("GPU time"), gpu_time.data(), gpu_time.size(), 1, 0, ImPlotLineFlags_Shaded, offset);
+			ImPlot::EndPlot();
+		}
+		ImPlot::PopStyleColor(5);
 	}
+	else
+		imgui_ctx->vibrate_on_hover();
 
-	ImGui::SameLine();
-
-	if (ImPlot::BeginPlot(_S("GPU time"), plot_size, ImPlotFlags_CanvasOnly))
+	if (ImGui::CollapsingHeader("Renderer stats"))
 	{
-		auto col = ImPlot::GetColormapColor(1);
+		imgui_ctx->vibrate_on_hover();
 
-		ImPlot::SetupAxes(nullptr, _S("GPU time [ms]"), ImPlotAxisFlags_NoDecorations, 0);
-		ImPlot::SetupAxesLimits(0, gpu_time.size() - 1, min_v, max_v, ImGuiCond_Always);
-		ImPlot::SetNextLineStyle(col);
-		ImPlot::SetNextFillStyle(col, 0.25);
-		ImPlot::PlotLine(_S("GPU time"), gpu_time.data(), gpu_time.size(), 1, 0, ImPlotLineFlags_Shaded, offset);
-		ImPlot::EndPlot();
+		const auto & stats = renderer->last_frame_stats();
+
+		ImGui::Text("Primitives: %zd total, %zd culled", stats.count_primitives, stats.count_culled_primitives);
+		ImGui::Text("Triangles: %zd total, %zd culled", stats.count_triangles, stats.count_culled_triangles);
+
+		if (ImGui::BeginTable("Node hierarchy", 2, ImGuiTableFlags_None))
+		{
+			gui_debug_node_hierarchy();
+			ImGui::EndTable();
+		}
 	}
-	ImPlot::PopStyleColor(5);
+	else
+		imgui_ctx->vibrate_on_hover();
 
-	ImGui::PopStyleVar();
+	ImGui::PopStyleVar(); // ImGuiStyleVar_ItemSpacing
 }
 #endif
 
 void scenes::lobby::gui_about()
 {
 	ImGui::PushFont(nullptr, constants::gui::font_size_large);
-	CenterTextH(std::string("WiVRn ") + wivrn::git_version);
+	CenterTextH(std::string("WiVRn ") + wivrn::display_version());
 	ImGui::PopFont();
 
 	ImGui::Dummy(ImVec2(0, 60));
@@ -1279,12 +1242,12 @@ void scenes::lobby::gui_first_run()
 	        item{
 	                .f = feature::face_tracking,
 	                .text = _S("Enable face tracking?"),
-	                .supported = application::get_face_tracking_supported(),
+	                .supported = not std::holds_alternative<std::monostate>(face_tracker),
 	        },
 	        item{
 	                .f = feature::body_tracking,
 	                .text = _S("Enable body tracking?"),
-	                .supported = application::get_body_tracking_supported(),
+	                .supported = system.body_tracker_supported() != xr::body_tracker_type::none,
 	        },
 	};
 
@@ -1293,6 +1256,8 @@ void scenes::lobby::gui_first_run()
 	ImGui::PushFont(nullptr, constants::gui::font_size_large);
 	CenterTextH(_("Welcome to WiVRn"));
 	ImGui::PopFont();
+
+	config.set_feature(feature::hand_tracking, true);
 
 	while (optional_feature_index < optional_features.size() and
 	       (not optional_features[optional_feature_index].supported or
@@ -1305,6 +1270,8 @@ void scenes::lobby::gui_first_run()
 		current_tab = tab::server_list;
 		config.first_run = false;
 		config.save();
+		ImGui::PopStyleVar(); // ImGuiStyleVar_ItemSpacing
+		return;
 	}
 
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10);
@@ -1344,13 +1311,13 @@ void scenes::lobby::gui_licenses()
 	ImGui::Text("%s", _("Licenses").c_str());
 	ImGui::PopFont();
 
-	const auto components = {"WiVRn", "FontAwesome", "openxr-loader", "simdjson", "SGSR"};
+	const auto components = {"WiVRn", "FontAwesome", "openxr-loader", "simdjson"};
 	if (not license)
 	{
 		selected_item = *components.begin();
 		try
 		{
-			license = std::make_unique<asset>(std::filesystem::path("licenses") / selected_item);
+			license = std::make_unique<utils::mapped_file>(std::filesystem::path("assets://licenses") / selected_item);
 		}
 		catch (...)
 		{
@@ -1363,7 +1330,7 @@ void scenes::lobby::gui_licenses()
 		{
 			try
 			{
-				auto current = std::make_unique<asset>(std::filesystem::path("licenses") / component);
+				auto current = std::make_unique<utils::mapped_file>(std::filesystem::path("assets://licenses") / component);
 				if (ImGui::Selectable(component, component == selected_item, ImGuiSelectableFlags_SelectOnRelease))
 				{
 					selected_item = component;
@@ -1380,56 +1347,6 @@ void scenes::lobby::gui_licenses()
 	imgui_ctx->vibrate_on_hover();
 	if (license)
 		ImGui::TextUnformatted((const char *)license->data(), (const char *)license->data() + license->size());
-}
-
-static bool RadioButtonWithoutCheckBox(const std::string & label, bool active, ImVec2 size_arg)
-{
-	ImGuiWindow * window = ImGui::GetCurrentWindow();
-	if (window->SkipItems)
-		return false;
-
-	ImGuiContext & g = *GImGui;
-	const ImGuiStyle & style = g.Style;
-	const ImGuiID id = window->GetID(label.c_str());
-	const ImVec2 label_size = ImGui::CalcTextSize(label.c_str(), NULL, true);
-
-	const ImVec2 pos = window->DC.CursorPos;
-
-	ImVec2 size = ImGui::CalcItemSize(size_arg, label_size.x + style.FramePadding.x * 2.0f, label_size.y + style.FramePadding.y * 2.0f);
-
-	const ImRect bb(pos, pos + size);
-	ImGui::ItemSize(bb, style.FramePadding.y);
-	if (!ImGui::ItemAdd(bb, id))
-		return false;
-
-	bool hovered, held;
-	bool pressed = ImGui::ButtonBehavior(bb, id, &hovered, &held);
-
-	ImGuiCol_ col;
-	if ((held && hovered) || active)
-		col = ImGuiCol_ButtonActive;
-	else if (hovered)
-		col = ImGuiCol_ButtonHovered;
-	else
-		col = ImGuiCol_Button;
-
-	ImGui::RenderNavHighlight(bb, id);
-	ImGui::RenderFrame(bb.Min, bb.Max, ImGui::GetColorU32(col), true, style.FrameRounding);
-
-	ImVec2 TextAlign{0, 0.5f};
-	ImGui::RenderTextClipped(bb.Min + style.FramePadding, bb.Max - style.FramePadding, label.c_str(), NULL, &label_size, TextAlign, &bb);
-
-	IMGUI_TEST_ENGINE_ITEM_INFO(id, label.c_str(), g.LastItemData.StatusFlags);
-	return pressed;
-}
-
-template <typename T>
-static bool RadioButtonWithoutCheckBox(const std::string & label, T * v, T v_button, ImVec2 size_arg)
-{
-	const bool pressed = RadioButtonWithoutCheckBox(label, *v == v_button, size_arg);
-	if (pressed)
-		*v = v_button;
-	return pressed;
 }
 
 static auto face_weights()
@@ -1614,11 +1531,23 @@ static auto face_weights()
 	return res;
 }
 
-static const char * get_face_icon(XrTime predicted_display_time)
+static const char * get_face_icon(XrTime predicted_display_time, xr::face_tracker & face_tracker)
 {
 	static const auto w = face_weights();
 	wivrn::from_headset::tracking::fb_face2 expression;
-	std::get<xr::fb_face_tracker2>(application::get_face_tracker()).get_weights(predicted_display_time, expression);
+	const char * result = nullptr;
+	std::visit(utils::overloaded{
+	                   [](std::monostate &) {},
+	                   [&](xr::android_face_tracker &) { result = ICON_FA_FACE_SMILE_WINK; },
+	                   [&](xr::htc_face_tracker &) { result = ICON_FA_FACE_SMILE_WINK; },
+	                   [&](auto & ft) {
+		                   ft.get_weights(predicted_display_time, expression);
+	                   },
+	           },
+	           face_tracker);
+
+	if (result)
+		return result;
 
 	if (not expression.is_valid)
 		return ICON_FA_FACE_MEH;
@@ -1661,7 +1590,7 @@ void scenes::lobby::draw_features_status(XrTime predicted_display_time)
 	        .icon_disabled = ICON_FA_MICROPHONE_SLASH,
 	});
 
-	if (application::get_hand_tracking_supported())
+	if (system.hand_tracking_supported())
 	{
 		items.push_back({
 		        .f = feature::hand_tracking,
@@ -1682,21 +1611,22 @@ void scenes::lobby::draw_features_status(XrTime predicted_display_time)
 		});
 	}
 
-	if (application::get_face_tracking_supported())
+	if (not std::holds_alternative<std::monostate>(face_tracker))
 	{
-		const char * icon_enabled = std::holds_alternative<xr::fb_face_tracker2>(application::get_face_tracker())
-		                                    ? get_face_icon(predicted_display_time)
-		                                    : ICON_FA_FACE_KISS_WINK_HEART;
 		items.push_back({
 		        .f = feature::face_tracking,
 		        .tooltip_enabled = _("Face tracking is enabled"),
 		        .tooltip_disabled = _("Face tracking is disabled"),
-		        .icon_enabled = icon_enabled,
+		        .icon_enabled = get_face_icon(predicted_display_time, face_tracker),
 		        .icon_disabled = ICON_FA_FACE_MEH_BLANK,
 		});
 	}
+	else if (system.face_tracker_supported() != xr::face_tracker_type::none and config.check_feature(feature::face_tracking))
+	{
+		face_tracker = xr::make_face_tracker(instance, system, session);
+	}
 
-	if (application::get_body_tracking_supported())
+	if (system.body_tracker_supported() != xr::body_tracker_type::none)
 	{
 		items.push_back({
 		        .f = feature::body_tracking,
@@ -1770,7 +1700,7 @@ void scenes::lobby::draw_features_status(XrTime predicted_display_time)
 			if (*status.charge > 0.995)
 				icon_nr = 5;
 			else
-				icon_nr = application::now() / 500'000'000 % 5;
+				icon_nr = instance.now() / 500'000'000 % 5;
 		}
 		else
 			icon_nr = std::round((*status.charge) * 4);
@@ -1851,9 +1781,46 @@ static bool is_gui_visible(imgui_context & ctx, XrTime predicted_display_time)
 	return true;
 }
 
+void scenes::lobby::update_transfers()
+{
+	for (auto & [name, transfer]: current_transfers)
+	{
+		transfer.first.sync();
+		if (transfer.first.get_state() == libcurl::state::done and transfer.second)
+			transfer.second(transfer.first);
+	}
+
+	std::erase_if(current_transfers, [](auto & x) {
+		auto state = x.second.first.get_state();
+		return state == libcurl::state::done or state == libcurl::state::reset;
+	});
+}
+
+void scenes::lobby::download(const std::string & url, const std::filesystem::path & path, std::function<void(libcurl::curl_handle & handle)> callback)
+{
+	current_transfers.emplace(url, std::make_pair(curl.download(url, path), std::move(callback)));
+}
+
+void scenes::lobby::download(const std::string & url, std::function<void(libcurl::curl_handle & handle)> callback)
+{
+	current_transfers.emplace(url, std::make_pair(curl.download(url), std::move(callback)));
+}
+
+libcurl::curl_handle * scenes::lobby::try_get_download_handle(const std::string & url)
+{
+	auto iter = current_transfers.find(url);
+	if (iter == current_transfers.end())
+		return nullptr;
+	else
+		return &iter->second.first;
+}
+
 std::vector<std::pair<int, XrCompositionLayerQuad>> scenes::lobby::draw_gui(XrTime predicted_display_time)
 {
 	imgui_ctx->new_frame(predicted_display_time);
+	update_transfers();
+	update_file_picker();
+
 	ImGuiStyle & style = ImGui::GetStyle();
 
 	const float TabWidth = 300;
@@ -1887,7 +1854,7 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> scenes::lobby::draw_gui(XrTi
 		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10);
 		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {10, 10});
 		ImGui::Begin("WiVRn", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
-		gui_connected();
+		gui_connected(predicted_display_time);
 		ImGui::End();
 		ImGui::PopStyleVar(3); // ImGuiStyleVar_WindowPadding, ImGuiStyleVar_FrameRounding, ImGuiStyleVar_FramePadding
 	}
@@ -1923,6 +1890,10 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> scenes::lobby::draw_gui(XrTi
 
 			case tab::post_processing:
 				gui_post_processing();
+				break;
+
+			case tab::customize:
+				gui_customize(predicted_display_time);
 				break;
 
 #if WIVRN_CLIENT_DEBUG_MENU
@@ -1962,28 +1933,31 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> scenes::lobby::draw_gui(XrTi
 			ImGui::BeginChild("Tabs", {TabWidth, ImGui::GetContentRegionMax().y - ImGui::GetWindowContentRegionMin().y});
 
 			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10, 10));
-			RadioButtonWithoutCheckBox(ICON_FA_COMPUTER "  " + _("Server list"), &current_tab, tab::server_list, {TabWidth, 0});
+			RadioButtonWithoutCheckBox(ICON_FA_COMPUTER "  " + _("Server list"), current_tab, tab::server_list, {TabWidth, 0});
 			imgui_ctx->vibrate_on_hover();
 
-			RadioButtonWithoutCheckBox(ICON_FA_GEARS "  " + _("Settings"), &current_tab, tab::settings, {TabWidth, 0});
+			RadioButtonWithoutCheckBox(ICON_FA_GEARS "  " + _("Settings"), current_tab, tab::settings, {TabWidth, 0});
 			imgui_ctx->vibrate_on_hover();
 
-			RadioButtonWithoutCheckBox(ICON_FA_WAND_MAGIC_SPARKLES "  " + _("Post-processing"), &current_tab, tab::post_processing, {TabWidth, 0});
+			RadioButtonWithoutCheckBox(ICON_FA_WAND_MAGIC_SPARKLES "  " + _("Post-processing"), current_tab, tab::post_processing, {TabWidth, 0});
+			imgui_ctx->vibrate_on_hover();
+
+			RadioButtonWithoutCheckBox(ICON_FA_PANORAMA "  " + _("Customize"), current_tab, tab::customize, {TabWidth, 0});
 			imgui_ctx->vibrate_on_hover();
 
 #if WIVRN_CLIENT_DEBUG_MENU
-			RadioButtonWithoutCheckBox(ICON_FA_BUG_SLASH "  " + _("Debug"), &current_tab, tab::debug, {TabWidth, 0});
+			RadioButtonWithoutCheckBox(ICON_FA_BUG_SLASH "  " + _("Debug"), current_tab, tab::debug, {TabWidth, 0});
 			imgui_ctx->vibrate_on_hover();
 #endif
 
 			ImGui::SetCursorPosY(ImGui::GetContentRegionMax().y - 3 * ImGui::GetCurrentContext()->FontSize - 6 * style.FramePadding.y - 2 * style.ItemSpacing.y - style.WindowPadding.y);
-			RadioButtonWithoutCheckBox(ICON_FA_CIRCLE_INFO "  " + _("About"), &current_tab, tab::about, {TabWidth, 0});
+			RadioButtonWithoutCheckBox(ICON_FA_CIRCLE_INFO "  " + _("About"), current_tab, tab::about, {TabWidth, 0});
 			imgui_ctx->vibrate_on_hover();
 
-			RadioButtonWithoutCheckBox(ICON_FA_SCALE_BALANCED "  " + _("Licenses"), &current_tab, tab::licenses, {TabWidth, 0});
+			RadioButtonWithoutCheckBox(ICON_FA_SCALE_BALANCED "  " + _("Licenses"), current_tab, tab::licenses, {TabWidth, 0});
 			imgui_ctx->vibrate_on_hover();
 
-			RadioButtonWithoutCheckBox(ICON_FA_DOOR_OPEN "  " + _("Exit"), &current_tab, tab::exit, {TabWidth, 0});
+			RadioButtonWithoutCheckBox(ICON_FA_DOOR_OPEN "  " + _("Exit"), current_tab, tab::exit, {TabWidth, 0});
 			imgui_ctx->vibrate_on_hover();
 
 			ImGui::PopStyleVar(); // ImGuiStyleVar_FramePadding
@@ -1999,7 +1973,7 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> scenes::lobby::draw_gui(XrTi
 
 	if (not is_gui_visible(*imgui_ctx, predicted_display_time))
 	{
-		if (application::get_hand_tracking_supported())
+		if (system.hand_tracking_supported())
 			display_recentering_tip(*imgui_ctx, _("Press the grip button or put your palm up\nto move the main window"));
 		else
 			display_recentering_tip(*imgui_ctx, _("Press the grip button to move the main window"));

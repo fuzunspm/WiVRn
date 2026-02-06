@@ -19,12 +19,13 @@
 
 #pragma once
 
+#include "app_launcher.h"
 #include "audio/audio.h"
 #include "decoder/shard_accumulator.h"
 #include "render/imgui_impl.h"
 #include "scene.h"
 #include "scenes/input_profile.h"
-#include "stream_reprojection.h"
+#include "stream_defoveator.h"
 #include "utils/thread_safe.h"
 #include "wifi_lock.h"
 #include "wivrn_client.h"
@@ -48,39 +49,35 @@ public:
 	};
 	static const size_t image_buffer_size = 3;
 
+	app_launcher apps;
+
 private:
 	static const size_t view_count = 2;
-
-	using stream_description = wivrn::to_headset::video_stream_description::item;
 
 	struct accumulator_images
 	{
 		std::unique_ptr<wivrn::shard_accumulator> decoder;
-		vk::raii::DescriptorSetLayout descriptor_set_layout = nullptr;
-		vk::DescriptorSet descriptor_set = nullptr;
-		vk::raii::PipelineLayout blit_pipeline_layout = nullptr;
-		vk::raii::Pipeline blit_pipeline = nullptr;
-		// latest frames from oldest to most recent
+		// latest frames, rolling buffer
 		std::array<std::shared_ptr<wivrn::shard_accumulator::blit_handle>, image_buffer_size> latest_frames;
 
 		std::shared_ptr<wivrn::shard_accumulator::blit_handle> frame(uint64_t id) const;
-		bool alpha() const;
-		std::vector<uint64_t> frames() const;
+		bool empty() const;
 	};
 
 	wifi_lock::wifi wifi;
 
 	// for frames inside accumulator images
 	std::mutex frames_mutex;
-	std::vector<std::shared_ptr<wivrn::shard_accumulator::blit_handle>> common_frame(XrTime display_time);
+	std::array<std::shared_ptr<wivrn::shard_accumulator::blit_handle>, view_count + 1> common_frame(XrTime display_time);
 
 	std::unique_ptr<wivrn_session> network_session;
 	std::atomic<bool> exiting = false;
 	std::thread network_thread;
-	std::mutex tracking_control_mutex;
-	to_headset::tracking_control tracking_control{};
+	thread_safe<to_headset::tracking_control> tracking_control{};
 	std::array<std::atomic<interaction_profile>, 2> interaction_profiles; // left and right hand
+	std::atomic<bool> interaction_profile_changed = false;
 	std::atomic<bool> recenter_requested = false;
+	std::atomic<bool> hid_forwarding = false;
 	std::atomic<XrDuration> display_time_phase = 0;
 	std::atomic<XrDuration> display_time_period = 0;
 	XrTime last_display_time = 0;
@@ -89,22 +86,9 @@ private:
 
 	std::shared_mutex decoder_mutex;
 	std::optional<to_headset::video_stream_description> video_stream_description;
-	std::vector<accumulator_images> decoders; // Locked by decoder_mutex
-	vk::raii::DescriptorPool blit_descriptor_pool = nullptr;
-	vk::raii::RenderPass blit_render_pass = nullptr;
+	std::array<accumulator_images, view_count + 1> decoders; // Locked by decoder_mutex
 
-	vk::Extent2D decoder_out_size;
-	vk::Format decoder_out_format;
-	image_allocation decoder_out_image;
-
-	struct renderpass_output
-	{
-		vk::raii::ImageView image_view = nullptr;
-		vk::raii::Framebuffer frame_buffer = nullptr;
-	};
-	std::array<renderpass_output, view_count> decoder_output;
-
-	std::optional<stream_reprojection> reprojector;
+	std::optional<stream_defoveator> defoveator;
 
 	vk::raii::Fence fence = nullptr;
 	vk::raii::CommandBuffer command_buffer = nullptr;
@@ -121,10 +105,11 @@ private:
 	state state_ = state::initializing;
 
 	xr::swapchain swapchain;
-	xr::swapchain swapchain_imgui;
 
 	std::optional<audio> audio_handle;
 
+	std::optional<xr::hand_tracker> left_hand;
+	std::optional<xr::hand_tracker> right_hand;
 	std::optional<input_profile> input;
 	static inline const uint32_t layer_controllers = 1 << 0;
 	static inline const uint32_t layer_rays = 1 << 1;
@@ -141,13 +126,17 @@ private:
 		compact,
 		stats,
 		settings,
-		foveation_settings
+		bitrate_settings,
+		foveation_settings,
+		applications,
+		application_launcher,
 	};
 
 	bool is_gui_interactable() const;
 
 	std::atomic<gui_status> gui_status = gui_status::hidden;
 	enum gui_status last_gui_status = gui_status::hidden;
+	enum gui_status next_gui_status = gui_status::applications;
 	XrTime gui_status_last_change;
 	float dimming = 0;
 
@@ -155,7 +144,7 @@ private:
 	XrAction plots_toggle_2 = XR_NULL_HANDLE;
 	XrAction recenter_left = XR_NULL_HANDLE;
 	XrAction recenter_right = XR_NULL_HANDLE;
-	XrAction foveation_pitch = XR_NULL_HANDLE;
+	XrAction settings_adjust = XR_NULL_HANDLE;
 	XrAction foveation_distance = XR_NULL_HANDLE;
 	XrAction foveation_ok = XR_NULL_HANDLE;
 	XrAction foveation_cancel = XR_NULL_HANDLE;
@@ -173,22 +162,35 @@ private:
 	void update_gui_position(xr::spaces controller);
 
 	// Keep a reference to the resources needed to blit the images until vkWaitForFences
-	std::vector<std::shared_ptr<wivrn::shard_accumulator::blit_handle>> current_blit_handles;
+	std::array<std::shared_ptr<wivrn::shard_accumulator::blit_handle>, view_count + 1> current_blit_handles;
 
-	// Last application list received from server
-	thread_safe<to_headset::application_list> applications;
+	XrTime running_application_req = 0;
+	thread_safe<to_headset::running_applications> running_applications;
 
-	stream();
+	stream(std::string server_name, scene & parent_scene);
+
+	bool forward_hid_input(from_headset::hid::input_t);
 
 public:
 	~stream();
 
-	static std::shared_ptr<stream> create(std::unique_ptr<wivrn_session> session, float guessed_fps);
+	static std::shared_ptr<stream> create(
+	        std::unique_ptr<wivrn_session> session,
+	        float guessed_fps,
+	        std::string server_name,
+	        scene & parent_scene);
 
 	void render(const XrFrameState &) override;
 	void on_focused() override;
 	void on_unfocused() override;
 	void on_xr_event(const xr::event &) override;
+
+	bool on_input_key_down(uint8_t key_code) override;
+	bool on_input_key_up(uint8_t key_code) override;
+	bool on_input_mouse_move(float x, float y) override;
+	bool on_input_button_down(uint8_t button) override;
+	bool on_input_button_up(uint8_t button) override;
+	bool on_input_scroll(float h, float v) override;
 
 	void operator()(to_headset::crypto_handshake &&) {};
 	void operator()(to_headset::pin_check_2 &&) {};
@@ -202,6 +204,8 @@ public:
 	void operator()(to_headset::video_stream_description &&);
 	void operator()(to_headset::refresh_rate_change &&);
 	void operator()(to_headset::application_list &&);
+	void operator()(to_headset::application_icon &&);
+	void operator()(to_headset::running_applications &&);
 	void operator()(audio_data &&);
 
 	void push_blit_handle(wivrn::shard_accumulator * decoder, std::shared_ptr<wivrn::shard_accumulator::blit_handle> handle);
@@ -216,11 +220,6 @@ public:
 	bool alive() const
 	{
 		return !exiting;
-	}
-
-	auto get_applications()
-	{
-		return applications.lock();
 	}
 
 	void start_application(std::string appid);
@@ -249,13 +248,11 @@ private:
 
 	struct gpu_timestamps
 	{
-		float gpu_barrier = 0;
 		float gpu_time = 0;
 	};
 
-	struct global_metric //: gpu_timestamps
+	struct global_metric
 	{
-		float gpu_barrier;
 		float gpu_time;
 		float cpu_time = 0;
 		float bandwidth_rx = 0;
@@ -268,7 +265,7 @@ private:
 		struct subplot
 		{
 			std::string title;
-			float scenes::stream::global_metric::*data;
+			float scenes::stream::global_metric::* data;
 		};
 		std::vector<subplot> subplots;
 		const char * unit;
@@ -304,11 +301,13 @@ private:
 	float compact_cpu_time = 0;
 	float compact_gpu_time = 0;
 
-	void accumulate_metrics(XrTime predicted_display_time, const std::vector<std::shared_ptr<wivrn::shard_accumulator::blit_handle>> & blit_handles, const gpu_timestamps & timestamps);
+	void accumulate_metrics(XrTime predicted_display_time, const std::array<std::shared_ptr<wivrn::shard_accumulator::blit_handle>, view_count + 1> & blit_handles, const gpu_timestamps & timestamps);
 	void gui_performance_metrics();
 	void gui_compact_view();
-	void gui_settings();
+	void gui_settings(float predicted_display_period);
+	void gui_bitrate_settings(float predicted_display_period);
 	void gui_foveation_settings(float predicted_display_period);
+	void gui_applications();
 	void draw_gui(XrTime predicted_display_time, XrDuration predicted_display_period);
 };
 } // namespace scenes

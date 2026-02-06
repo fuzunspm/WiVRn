@@ -25,7 +25,6 @@
 
 #include "utils/named_thread.h"
 
-#include <algorithm>
 #include <spdlog/spdlog.h>
 #include <uni_algo/case.h>
 
@@ -78,6 +77,9 @@ void scenes::stream::operator()(to_headset::video_stream_description && desc)
 void scenes::stream::operator()(to_headset::refresh_rate_change && rate)
 {
 	session.set_refresh_rate(rate.fps);
+	std::shared_lock lock(decoder_mutex);
+	if (video_stream_description)
+		video_stream_description->fps = rate.fps;
 }
 
 void scenes::stream::operator()(to_headset::timesync_query && query)
@@ -106,13 +108,19 @@ void scenes::stream::send_feedback(const wivrn::from_headset::feedback & feedbac
 	}
 }
 
-void scenes::stream::operator()(to_headset::application_list && apps)
+void scenes::stream::operator()(to_headset::application_list && l)
 {
-	std::ranges::sort(apps.applications, [](auto & l, auto & r) {
-		return una::casesens::collate_utf8(l.name, r.name) < 0;
-	});
-	auto locked = applications.lock();
-	*locked = std::move(apps);
+	apps(std::move(l));
+}
+
+void scenes::stream::operator()(to_headset::application_icon && icon)
+{
+	apps(std::move(icon));
+}
+
+void scenes::stream::operator()(to_headset::running_applications && apps)
+{
+	*running_applications.lock() = std::move(apps);
 }
 
 void scenes::stream::start_application(std::string appid)

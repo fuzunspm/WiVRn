@@ -29,10 +29,7 @@
 #include <cassert>
 #include <memory>
 #include <nlohmann/json.hpp>
-
-#if WIVRN_CHECK_CAPSYSNICE
-#include <sys/capability.h>
-#endif
+#include <unistd.h>
 
 #include <vulkan/vulkan.hpp>
 #include <vulkan/vulkan_raii.hpp>
@@ -43,24 +40,6 @@ static QString server_path()
 {
 	return QCoreApplication::applicationDirPath() + "/wivrn-server";
 }
-
-#if WIVRN_CHECK_CAPSYSNICE
-static bool has_cap_sys_nice()
-{
-	auto caps = cap_get_file(server_path().toStdString().c_str());
-
-	if (not caps)
-		return false;
-
-	cap_flag_value_t value{};
-	if (cap_get_flag(caps, CAP_SYS_NICE, CAP_EFFECTIVE, &value) < 0)
-		return false;
-
-	cap_free(caps);
-
-	return value == CAP_SET;
-}
-#endif
 
 wivrn_server::wivrn_server(QObject * parent) :
         QObject(parent)
@@ -74,12 +53,6 @@ wivrn_server::wivrn_server(QObject * parent) :
 	const QStringList services = QDBusConnection::sessionBus().interface()->registeredServiceNames();
 	if (services.contains("io.github.wivrn.Server"))
 		on_server_dbus_registered();
-
-#if WIVRN_CHECK_CAPSYSNICE
-	m_capSysNice = has_cap_sys_nice();
-#else
-	m_capSysNice = true;
-#endif
 }
 
 wivrn_server::~wivrn_server()
@@ -256,6 +229,7 @@ void wivrn_server::on_server_dbus_registered()
 	server_properties_interface = std::make_unique<OrgFreedesktopDBusPropertiesInterface>("io.github.wivrn.Server", "/io/github/wivrn/Server", QDBusConnection::sessionBus(), this);
 
 	connect(server_properties_interface.get(), &OrgFreedesktopDBusPropertiesInterface::PropertiesChanged, this, &wivrn_server::on_server_properties_changed);
+	connect(server_interface.get(), &IoGithubWivrnServerInterface::ServerError, [this](const QString & w, const QString & m) { serverError(serverErrorData(w, m)); });
 
 	serverStatusChanged(m_serverStatus = Status::Started);
 	refresh_server_properties();
@@ -278,52 +252,14 @@ void wivrn_server::on_server_dbus_unregistered()
 	if (isHeadsetConnected())
 		headsetConnectedChanged(m_headsetConnected = false);
 
+	if (isSessionRunning())
+		sessionRunningChanged(m_sessionRunning = false);
+
 	if (isPairingEnabled())
 		pairingEnabledChanged(m_isPairingEnabled = false);
 
 	if (serverStatus() == Status::Restarting)
 		start_server();
-}
-
-void wivrn_server::grant_cap_sys_nice()
-{
-#if WIVRN_CHECK_CAPSYSNICE
-	if (not setcap_process)
-	{
-		setcap_process = std::make_unique<QProcess>();
-		setcap_process->setProgram("pkexec");
-		setcap_process->setArguments({"setcap", "CAP_SYS_NICE=+ep", server_path()});
-		setcap_process->setProcessChannelMode(QProcess::MergedChannels);
-		setcap_process->start();
-
-		QObject::connect(setcap_process.get(), &QProcess::finished, this, [this](int exit_code, QProcess::ExitStatus exit_status) {
-			// Exit codes:
-			// 0: setcap successful
-			// 1: setcap failed
-			// 126: pkexec: not authorized or authentication error
-			// 127: pkexec: dismissed by user
-
-			if (exit_status == QProcess::NormalExit and exit_code == 0)
-			{
-				if (not has_cap_sys_nice())
-				{
-					qDebug() << "pkexec setcap returned successfully but the server does not have the CAP_SYS_NICE capability";
-				}
-				else
-				{
-					qDebug() << "setcap sucessful";
-					capSysNiceChanged(m_capSysNice = true);
-				}
-			}
-			else
-			{
-				qWarning() << "setcap exited with status" << exit_status << "and code" << exit_code;
-			}
-
-			setcap_process.release()->deleteLater();
-		});
-	}
-#endif
 }
 
 void wivrn_server::open_server_logs()
@@ -357,6 +293,11 @@ void wivrn_server::on_server_properties_changed(const QString & interface_name, 
 	if (changed_properties.contains("HeadsetConnected"))
 	{
 		headsetConnectedChanged(m_headsetConnected = changed_properties["HeadsetConnected"].toBool());
+	}
+
+	if (changed_properties.contains("SessionRunning"))
+	{
+		sessionRunningChanged(m_sessionRunning = changed_properties["SessionRunning"].toBool());
 	}
 
 	if (changed_properties.contains("JsonConfiguration"))
@@ -498,6 +439,11 @@ void wivrn_server::on_server_properties_changed(const QString & interface_name, 
 		supportedCodecsChanged(m_supportedCodecs = changed_properties["SupportedCodecs"].toStringList());
 	}
 
+	if (changed_properties.contains("SystemName"))
+	{
+		systemNameChanged(m_systemName = changed_properties["SystemName"].toString());
+	}
+
 	if (changed_properties.contains("SteamCommand"))
 	{
 		steamCommandChanged(m_steamCommand = changed_properties["SteamCommand"].toString());
@@ -506,29 +452,37 @@ void wivrn_server::on_server_properties_changed(const QString & interface_name, 
 
 void wivrn_server::setJsonConfiguration(QString new_configuration)
 {
-	server_interface->setJsonConfiguration(m_jsonConfiguration = new_configuration);
-	jsonConfigurationChanged(new_configuration);
+	if (server_interface)
+	{
+		server_interface->setJsonConfiguration(m_jsonConfiguration = new_configuration);
+		jsonConfigurationChanged(new_configuration);
+	}
 }
 
 void wivrn_server::revoke_key(QString public_key)
 {
-	server_interface->RevokeKey(public_key);
+	if (server_interface)
+		server_interface->RevokeKey(public_key);
 }
 
 void wivrn_server::rename_key(QString public_key, QString name)
 {
-	server_interface->RenameKey(public_key, name);
+	if (server_interface)
+		server_interface->RenameKey(public_key, name);
 }
 
 QString wivrn_server::enable_pairing(int timeout_secs)
 {
 	qDebug() << "Enabling pairing for" << timeout_secs << "seconds";
-	return server_interface->EnablePairing(timeout_secs).value();
+	if (server_interface)
+		return server_interface->EnablePairing(timeout_secs).value();
+	return "";
 }
 
 void wivrn_server::disable_pairing()
 {
-	server_interface->DisablePairing();
+	if (server_interface)
+		server_interface->DisablePairing();
 }
 
 QString wivrn_server::hostname()

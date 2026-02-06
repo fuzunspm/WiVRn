@@ -19,18 +19,19 @@
 
 #include "session.h"
 
-#include "application.h"
 #include "details/enumerate.h"
 #include "openxr/openxr.h"
 #include "utils/contains.h"
 #include "xr/instance.h"
 #include "xr/system.h"
+#include "xr/to_string.h"
 #include <ranges>
 #include <vulkan/vulkan.h>
 #include <openxr/openxr_platform.h>
 
-xr::session::session(xr::instance & inst, xr::system & sys, vk::raii::Instance & vk_inst, vk::raii::PhysicalDevice & pdev, vk::raii::Device & dev, int queue_family_index) :
-        inst(&inst)
+xr::session::session(xr::instance & inst, xr::system & sys, vk::raii::Instance & vk_inst, vk::raii::PhysicalDevice & pdev, vk::raii::Device & dev, thread_safe<vk::raii::Queue> & queue, int queue_family_index) :
+        inst(&inst),
+        queue(&queue)
 {
 	XrGraphicsBindingVulkan2KHR vulkan_binding{
 	        .type = XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR,
@@ -49,6 +50,16 @@ xr::session::session(xr::instance & inst, xr::system & sys, vk::raii::Instance &
 	};
 
 	CHECK_XR(xrCreateSession(inst, &session_info, &id));
+
+	if (inst.has_extension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME))
+	{
+		xrGetDisplayRefreshRateFB = inst.get_proc<PFN_xrGetDisplayRefreshRateFB>("xrGetDisplayRefreshRateFB");
+		xrEnumerateDisplayRefreshRatesFB = inst.get_proc<PFN_xrEnumerateDisplayRefreshRatesFB>("xrEnumerateDisplayRefreshRatesFB");
+		xrRequestDisplayRefreshRateFB = inst.get_proc<PFN_xrRequestDisplayRefreshRateFB>("xrRequestDisplayRefreshRateFB");
+	}
+
+	if (inst.has_extension(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME))
+		xrPerfSettingsSetPerformanceLevelEXT = inst.get_proc<PFN_xrPerfSettingsSetPerformanceLevelEXT>("xrPerfSettingsSetPerformanceLevelEXT");
 }
 
 std::vector<XrReferenceSpaceType> xr::session::get_reference_spaces() const
@@ -127,21 +138,27 @@ void xr::session::begin_frame()
 	        .type = XR_TYPE_FRAME_BEGIN_INFO,
 	};
 
-	auto lock = application::get_queue().lock();
+	auto lock = queue->lock();
 	CHECK_XR(xrBeginFrame(id, &begin_info));
 }
 
 void xr::session::end_frame(XrTime display_time, const std::vector<XrCompositionLayerBaseHeader *> & layers, XrEnvironmentBlendMode blend_mode)
 {
-	XrFrameEndInfo end_info{
+	const XrLocalDimmingFrameEndInfoMETA local_dimming_info{
+	        .type = XR_TYPE_LOCAL_DIMMING_FRAME_END_INFO_META,
+	        .localDimmingMode = XR_LOCAL_DIMMING_MODE_ON_META,
+	};
+
+	const XrFrameEndInfo end_info{
 	        .type = XR_TYPE_FRAME_END_INFO,
+	        .next = inst->has_extension(XR_META_LOCAL_DIMMING_EXTENSION_NAME) ? &local_dimming_info : nullptr,
 	        .displayTime = display_time,
 	        .environmentBlendMode = blend_mode,
 	        .layerCount = (uint32_t)layers.size(),
 	        .layers = layers.data(),
 	};
 
-	auto lock = application::get_queue().lock();
+	auto lock = queue->lock();
 	CHECK_XR(xrEndFrame(id, &end_info));
 }
 
@@ -176,7 +193,7 @@ XrViewStateFlags xr::session::locate_views(XrViewConfigurationType view_config_t
 	        .type = XR_TYPE_VIEW_STATE,
 	};
 
-	details::enumerate<XrView>(xrLocateViews, views, id, &view_locate_info, &view_state);
+	details::enumerate(xrLocateViews, views, id, &view_locate_info, &view_state);
 
 	return view_state.viewStateFlags;
 }
@@ -258,7 +275,6 @@ std::vector<std::string> xr::session::localized_sources_for_action(XrAction acti
 float xr::session::get_current_refresh_rate()
 {
 	assert(inst->has_extension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME));
-	static auto xrGetDisplayRefreshRateFB = inst->get_proc<PFN_xrGetDisplayRefreshRateFB>("xrGetDisplayRefreshRateFB");
 
 	float refresh_rate = 0;
 	if (xrGetDisplayRefreshRateFB)
@@ -269,9 +285,6 @@ float xr::session::get_current_refresh_rate()
 
 std::vector<float> xr::session::get_refresh_rates()
 {
-	assert(inst->has_extension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME));
-	static auto xrEnumerateDisplayRefreshRatesFB = inst->get_proc<PFN_xrEnumerateDisplayRefreshRatesFB>("xrEnumerateDisplayRefreshRatesFB");
-
 	if (xrEnumerateDisplayRefreshRatesFB)
 	{
 		try
@@ -289,10 +302,6 @@ std::vector<float> xr::session::get_refresh_rates()
 
 void xr::session::set_refresh_rate(float refresh_rate)
 {
-	if (not inst->has_extension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME))
-		return;
-	static auto xrRequestDisplayRefreshRateFB = inst->get_proc<PFN_xrRequestDisplayRefreshRateFB>("xrRequestDisplayRefreshRateFB");
-
 	if (xrRequestDisplayRefreshRateFB)
 	{
 		if (auto res = xrRequestDisplayRefreshRateFB(id, refresh_rate); res != XR_SUCCESS)
@@ -344,14 +353,14 @@ void xr::session::enable_passthrough(xr::system & system)
 	if (not std::holds_alternative<std::monostate>(passthrough))
 		return;
 
-	if (system.passthrough_supported() == xr::system::passthrough_type::no_passthrough)
+	if (system.passthrough_supported() == xr::passthrough_type::none)
 		return;
 
-	if (utils::contains(application::get_xr_extensions(), XR_FB_PASSTHROUGH_EXTENSION_NAME))
+	if (inst->has_extension(XR_FB_PASSTHROUGH_EXTENSION_NAME))
 	{
 		passthrough.emplace<xr::passthrough_fb>(*inst, *this);
 	}
-	else if (utils::contains(application::get_xr_extensions(), XR_HTC_PASSTHROUGH_EXTENSION_NAME))
+	else if (inst->has_extension(XR_HTC_PASSTHROUGH_EXTENSION_NAME))
 	{
 		passthrough.emplace<xr::passthrough_htc>(*inst, *this);
 	}
@@ -366,4 +375,10 @@ void xr::session::disable_passthrough()
 	if (std::holds_alternative<std::monostate>(passthrough))
 		return;
 	passthrough.emplace<std::monostate>();
+}
+
+void xr::session::set_performance_level(XrPerfSettingsDomainEXT domain, XrPerfSettingsLevelEXT level)
+{
+	if (xrPerfSettingsSetPerformanceLevelEXT)
+		xrPerfSettingsSetPerformanceLevelEXT(*this, domain, level);
 }

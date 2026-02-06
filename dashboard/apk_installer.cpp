@@ -42,9 +42,7 @@ bool apk_installer::isTagged() const
 
 QString apk_installer::currentVersion() const
 {
-	if (wivrn::git_version[0] == 'v')
-		return &wivrn::git_version[1];
-	return wivrn::git_version;
+	return wivrn::display_version();
 }
 
 QCoro::Task<> apk_installer::doRefreshLatestVersion()
@@ -93,7 +91,7 @@ QCoro::Task<> apk_installer::doRefreshLatestVersion()
 		{
 			std::string name = i["name"];
 
-			if (name.ends_with("-standard-release.apk"))
+			if (name.ends_with("-release.apk"))
 			{
 				m_apkUrl = QString::fromStdString(i["browser_download_url"]);
 				break;
@@ -109,7 +107,7 @@ QCoro::Task<> apk_installer::doRefreshLatestVersion()
 	else
 	{
 		apkAvailableChanged(false);
-		qDebug() << "No precompiled APK is available for this version";
+		qDebug() << "No APK is available for this version";
 	}
 
 	busyChanged(m_busy = false);
@@ -133,7 +131,13 @@ QCoro::Task<> apk_installer::doInstallApk(QString serial)
 
 		auto apk_dir = std::filesystem::path(m_apkFile.fileName().toStdString()).parent_path();
 		std::filesystem::create_directories(apk_dir);
-		m_apkFile.open(QIODeviceBase::WriteOnly | QIODeviceBase::Truncate);
+		if (not m_apkFile.open(QIODeviceBase::WriteOnly | QIODeviceBase::Truncate))
+		{
+			qDebug() << "Cannot save APK file " << m_apkFile.fileName() << ": " << m_apkFile.errorString();
+			installStatusChanged(m_installStatus = i18n("Cannot save APK file: %1", m_apkFile.errorString()));
+			busyChanged(m_busy = false);
+			co_return;
+		}
 
 		qDebug() << "Downloading from" << m_apkUrl.toString() << "to" << m_apkFile.fileName();
 

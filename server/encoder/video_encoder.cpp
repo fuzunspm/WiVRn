@@ -24,7 +24,6 @@
 
 #include "encoder_settings.h"
 #include "os/os_time.h"
-#include "util/u_logging.h"
 #include "wivrn_config.h"
 
 #include <string>
@@ -40,8 +39,9 @@
 #endif
 #if WIVRN_USE_VULKAN_ENCODE
 #include "video_encoder_vulkan_h264.h"
-// #include "video_encoder_vulkan_h265.h"
+#include "video_encoder_vulkan_h265.h"
 #endif
+#include "video_encoder_raw.h"
 
 namespace wivrn
 {
@@ -102,30 +102,26 @@ std::shared_ptr<video_encoder::sender> video_encoder::sender::get()
 
 std::unique_ptr<video_encoder> video_encoder::create(
         wivrn_vk_bundle & wivrn_vk,
-        encoder_settings & settings,
-        uint8_t stream_idx,
-        int input_width,
-        int input_height,
-        float fps)
+        const encoder_settings & settings,
+        uint8_t stream_idx)
 {
 	using namespace std::string_literals;
 	std::unique_ptr<video_encoder> res;
-	settings.range = VK_SAMPLER_YCBCR_RANGE_ITU_FULL;
-	settings.color_model = VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_709;
 	if (settings.encoder_name == encoder_vulkan)
 	{
 #if WIVRN_USE_VULKAN_ENCODE
 		switch (settings.codec)
 		{
 			case video_codec::h264:
-				res = video_encoder_vulkan_h264::create(wivrn_vk, settings, fps, stream_idx);
+				res = video_encoder_vulkan_h264::create(wivrn_vk, settings, stream_idx);
 				break;
 			case video_codec::h265:
-				throw std::runtime_error("h265 not supported for vulkan video encode");
-				// res = video_encoder_vulkan_h265::create(wivrn_vk, settings, fps);
-				// break;
+				res = video_encoder_vulkan_h265::create(wivrn_vk, settings, stream_idx);
+				break;
 			case video_codec::av1:
 				throw std::runtime_error("av1 not supported for vulkan video encode");
+			case video_codec::raw:
+				throw std::runtime_error("raw codec only supported on raw encoder");
 		}
 #else
 		throw std::runtime_error("Vulkan video encode not enabled");
@@ -134,7 +130,7 @@ std::unique_ptr<video_encoder> video_encoder::create(
 	if (settings.encoder_name == encoder_x264)
 	{
 #if WIVRN_USE_X264
-		res = std::make_unique<video_encoder_x264>(wivrn_vk, settings, fps, stream_idx);
+		res = std::make_unique<video_encoder_x264>(wivrn_vk, settings, stream_idx);
 #else
 		throw std::runtime_error("x264 encoder not enabled");
 #endif
@@ -142,7 +138,7 @@ std::unique_ptr<video_encoder> video_encoder::create(
 	if (settings.encoder_name == encoder_nvenc)
 	{
 #if WIVRN_USE_NVENC
-		res = std::make_unique<video_encoder_nvenc>(wivrn_vk, settings, fps, stream_idx);
+		res = std::make_unique<video_encoder_nvenc>(wivrn_vk, settings, stream_idx);
 #else
 		throw std::runtime_error("nvenc support not enabled");
 #endif
@@ -150,11 +146,17 @@ std::unique_ptr<video_encoder> video_encoder::create(
 	if (settings.encoder_name == encoder_vaapi)
 	{
 #if WIVRN_USE_VAAPI
-		res = std::make_unique<video_encoder_va>(wivrn_vk, settings, fps, stream_idx);
+		res = std::make_unique<video_encoder_va>(wivrn_vk, settings, stream_idx);
 #else
 		throw std::runtime_error("vaapi support not enabled");
 #endif
 	}
+
+	if (settings.encoder_name == encoder_raw)
+	{
+		res = std::make_unique<video_encoder_raw>(wivrn_vk, settings, stream_idx);
+	}
+
 	if (not res)
 		throw std::runtime_error("Failed to create encoder " + settings.encoder_name);
 
@@ -174,47 +176,30 @@ std::unique_ptr<video_encoder> video_encoder::create(
 			case av1:
 				file += ".av1";
 				break;
+			case raw:
+				file += ".yuv";
+				break;
 		}
 		res->video_dump.open(file);
 	}
 	return res;
 }
 
-#if WIVRN_USE_VULKAN_ENCODE
-std::pair<std::vector<vk::VideoProfileInfoKHR>, vk::ImageUsageFlags> video_encoder::get_create_image_info(const std::vector<encoder_settings> & settings)
-{
-	std::pair<std::vector<vk::VideoProfileInfoKHR>, vk::ImageUsageFlags> result;
-	for (const auto & item: settings)
-	{
-		if (item.encoder_name == encoder_vulkan)
-		{
-			result.second |= vk::ImageUsageFlagBits::eVideoEncodeSrcKHR;
-			switch (item.codec)
-			{
-				case h264:
-					result.first.push_back(video_encoder_vulkan_h264::video_profile_info.get());
-					break;
-				case h265:
-					// result.first.push_back(video_encoder_vulkan_h265::video_profile_info.get());
-					break;
-				case av1:
-					throw std::runtime_error("av1 not supported for vulkan video encode");
-			}
-		}
-	}
-	return result;
-}
-#endif
-
-static const uint64_t idr_throttle = 100;
-
-video_encoder::video_encoder(uint8_t stream_idx, to_headset::video_stream_description::channels_t channels, double bitrate_multiplier, bool async_send) :
+video_encoder::video_encoder(uint8_t stream_idx,
+                             const encoder_settings & settings,
+                             std::unique_ptr<idr_handler> idr,
+                             bool async_send) :
         stream_idx(stream_idx),
-        channels(channels),
-        bitrate_multiplier(bitrate_multiplier),
-        last_idr_frame(-idr_throttle),
-        shared_sender(async_send ? sender::get() : nullptr)
-{}
+        bitrate_multiplier(settings.bitrate_multiplier),
+        shared_sender(async_send ? sender::get() : nullptr),
+        idr(std::move(idr)),
+        extent{
+                .width = settings.width,
+                .height = settings.height,
+        }
+{
+	assert(this->idr);
+}
 
 video_encoder::~video_encoder()
 {
@@ -224,16 +209,16 @@ video_encoder::~video_encoder()
 
 void video_encoder::on_feedback(const from_headset::feedback & feedback)
 {
-	if (not feedback.sent_to_decoder)
-		sync_needed = true;
+	assert(feedback.stream_index == stream_idx);
+	idr->on_feedback(feedback);
 }
 
 void video_encoder::reset()
 {
-	sync_needed = true;
+	idr->reset();
 }
 
-void video_encoder::set_bitrate(int bitrate_bps)
+void video_encoder::set_bitrate(uint32_t bitrate_bps)
 {
 	pending_bitrate = bitrate_bps;
 }
@@ -247,13 +232,20 @@ std::pair<bool, vk::Semaphore> video_encoder::present_image(vk::Image y_cbcr, vk
 {
 	// Wait for encoder to be done
 	present_slot = (present_slot + 1) % num_slots;
-	busy[present_slot].wait(true);
-	busy[present_slot] = true;
+	state[present_slot].wait(busy);
+	if (idr->should_skip(frame_index))
+	{
+		state[present_slot] = skip;
+		return {false, nullptr};
+	}
+	state[present_slot] = busy;
 	return present_image(y_cbcr, cmd_buf, present_slot, frame_index);
 }
 
 void video_encoder::post_submit()
 {
+	if (state[present_slot] == skip)
+		return;
 	post_submit(present_slot);
 }
 
@@ -262,28 +254,30 @@ void video_encoder::encode(wivrn_session & cnx,
                            uint64_t frame_index)
 {
 	encode_slot = (encode_slot + 1) % num_slots;
-	assert(busy[encode_slot].load());
+
+	struct idle_setter
+	{
+		std::atomic_unsigned_lock_free & state;
+		~idle_setter()
+		{
+			state = idle;
+			state.notify_all();
+		}
+	};
+	idle_setter i{state[encode_slot]};
+
+	if (state[encode_slot] == skip)
+		return;
+
 	if (shared_sender)
 		shared_sender->wait_idle(this);
 	this->cnx = &cnx;
-	auto target_timestamp = std::chrono::steady_clock::time_point(std::chrono::nanoseconds(view_info.display_time));
-	bool idr = sync_needed.exchange(false);
-	// Throttle idr to prevent overloading the decoder
-	if (idr and frame_index < last_idr_frame + idr_throttle)
-	{
-		U_LOG_D("Throttle IDR: stream %" PRIu8 " frame %" PRIu64, stream_idx, frame_index);
-		sync_needed = true;
-		idr = false;
-	}
-	if (idr)
-		last_idr_frame = frame_index;
-	const char * extra = idr ? ",idr" : ",p";
 	clock = cnx.get_offset();
 
+	auto encode_begin = os_monotonic_get_ns();
 	timing_info = {
-	        .encode_begin = clock.to_headset(os_monotonic_get_ns()),
+	        .encode_begin = clock.to_headset(encode_begin),
 	};
-	cnx.dump_time("encode_begin", frame_index, os_monotonic_get_ns(), stream_idx, extra);
 
 	// Prepare the video shard template
 	shard.stream_item_idx = stream_idx;
@@ -292,26 +286,15 @@ void video_encoder::encode(wivrn_session & cnx,
 	shard.view_info = view_info;
 	shard.timing_info.reset();
 
-	std::exception_ptr ex;
-	try
+	auto data = encode(encode_slot, frame_index);
+	cnx.dump_time("encode_begin", frame_index, encode_begin, stream_idx);
+	cnx.dump_time("encode_end", frame_index, os_monotonic_get_ns(), stream_idx);
+	if (data)
 	{
-		auto data = encode(idr, target_timestamp, encode_slot);
-		cnx.dump_time("encode_end", frame_index, os_monotonic_get_ns(), stream_idx, extra);
-		if (data)
-		{
-			timing_info.encode_end = clock.to_headset(os_monotonic_get_ns());
-			assert(shared_sender);
-			shared_sender->push(std::move(*data));
-		}
+		timing_info.encode_end = clock.to_headset(os_monotonic_get_ns());
+		assert(shared_sender);
+		shared_sender->push(std::move(*data));
 	}
-	catch (...)
-	{
-		ex = std::current_exception();
-	}
-	busy[encode_slot] = false;
-	busy[encode_slot].notify_all();
-	if (ex)
-		std::rethrow_exception(ex);
 }
 
 void video_encoder::SendData(std::span<uint8_t> data, bool end_of_frame, bool control)
@@ -331,21 +314,18 @@ void video_encoder::SendData(std::span<uint8_t> data, bool end_of_frame, bool co
 		timing_info.send_begin = clock.to_headset(os_monotonic_get_ns());
 	}
 
-	shard.flags = to_headset::video_stream_data_shard::start_of_slice;
+	ssize_t max_payload_size = cnx->has_stream() ? to_headset::video_stream_data_shard::max_payload_size : std::numeric_limits<uint32_t>::max();
+
 	auto begin = data.begin();
 	auto end = data.end();
 	while (begin != end)
 	{
-		const size_t max_payload_size = std::max(0z, ssize_t(to_headset::video_stream_data_shard::max_payload_size) - ssize_t(serialized_size(shard.view_info)));
-		auto next = std::min(end, begin + max_payload_size);
+		const size_t payload_size = std::max(0z, max_payload_size - ssize_t(serialized_size(shard.view_info)));
+		auto next = std::min(end, begin + payload_size);
 		if (next == end)
 		{
-			shard.flags |= to_headset::video_stream_data_shard::end_of_slice;
 			if (end_of_frame)
-			{
-				shard.flags |= to_headset::video_stream_data_shard::end_of_frame;
 				shard.timing_info = timing_info;
-			}
 		}
 		shard.payload = {begin, next};
 		try
@@ -360,7 +340,6 @@ void video_encoder::SendData(std::span<uint8_t> data, bool end_of_frame, bool co
 			// Ignore network errors
 		}
 		++shard.shard_idx;
-		shard.flags = 0;
 		shard.view_info.reset();
 		begin = next;
 	}

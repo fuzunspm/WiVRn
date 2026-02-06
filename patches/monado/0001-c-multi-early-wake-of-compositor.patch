@@ -1,4 +1,4 @@
-From 18e184e504d9f55dbba3f02c87f96410b2ce04ab Mon Sep 17 00:00:00 2001
+From cdc149ced7ae13d7b8601ab5af532f3e7739df2c Mon Sep 17 00:00:00 2001
 From: Patrick Nicolas <patricknicolas@laposte.net>
 Date: Tue, 22 Oct 2024 15:23:19 +0200
 Subject: [PATCH 01/10] c/multi: early wake of compositor
@@ -10,10 +10,10 @@ Subject: [PATCH 01/10] c/multi: early wake of compositor
  3 files changed, 41 insertions(+), 7 deletions(-)
 
 diff --git a/src/xrt/compositor/multi/comp_multi_compositor.c b/src/xrt/compositor/multi/comp_multi_compositor.c
-index 553565db4..789a2d042 100644
+index 94cea110e..88347a092 100644
 --- a/src/xrt/compositor/multi/comp_multi_compositor.c
 +++ b/src/xrt/compositor/multi/comp_multi_compositor.c
-@@ -232,7 +232,21 @@ wait_for_scheduled_free(struct multi_compositor *mc)
+@@ -236,7 +236,21 @@ wait_for_scheduled_free(struct multi_compositor *mc)
  	os_mutex_lock(&mc->slot_lock);
  	slot_move_and_clear_locked(mc, &mc->scheduled, &mc->progress);
  	os_mutex_unlock(&mc->slot_lock);
@@ -51,10 +51,10 @@ index 3351defa4..e8f0c8295 100644
  	{
  		int64_t predicted_display_time_ns;
 diff --git a/src/xrt/compositor/multi/comp_multi_system.c b/src/xrt/compositor/multi/comp_multi_system.c
-index be763d1c1..22c801f65 100644
+index 4db923457..80cbbbc26 100644
 --- a/src/xrt/compositor/multi/comp_multi_system.c
 +++ b/src/xrt/compositor/multi/comp_multi_system.c
-@@ -23,6 +23,8 @@
+@@ -24,6 +24,8 @@
  #include "util/u_trace_marker.h"
  #include "util/u_distortion_mesh.h"
  
@@ -63,7 +63,7 @@ index be763d1c1..22c801f65 100644
  #ifdef XRT_OS_LINUX
  #include "util/u_linux.h"
  #endif
-@@ -392,17 +394,24 @@ broadcast_timings_to_pacers(struct multi_system_compositor *msc,
+@@ -393,17 +395,24 @@ broadcast_timings_to_pacers(struct multi_system_compositor *msc,
  }
  
  static void
@@ -93,7 +93,7 @@ index be763d1c1..22c801f65 100644
  }
  
  static void
-@@ -527,10 +536,13 @@ multi_main_loop(struct multi_system_compositor *msc)
+@@ -530,10 +539,13 @@ multi_main_loop(struct multi_system_compositor *msc)
  		broadcast_timings_to_clients(msc, predicted_display_time_ns);
  
  		// Now we can wait.
@@ -109,7 +109,7 @@ index be763d1c1..22c801f65 100644
  
  		// Now we know the diff, broadcast to pacers.
  		broadcast_timings_to_pacers(msc, predicted_display_time_ns, predicted_display_period_ns, diff_ns);
-@@ -707,6 +719,8 @@ system_compositor_destroy(struct xrt_system_compositor *xsc)
+@@ -721,6 +733,8 @@ system_compositor_destroy(struct xrt_system_compositor *xsc)
  	xrt_comp_native_destroy(&msc->xcn);
  
  	os_mutex_destroy(&msc->list_and_timing_lock);
@@ -118,7 +118,7 @@ index be763d1c1..22c801f65 100644
  
  	free(msc);
  }
-@@ -761,6 +775,8 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
+@@ -775,6 +789,8 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
  	msc->sessions.state = do_warm_start ? MULTI_SYSTEM_STATE_INIT_WARM_START : MULTI_SYSTEM_STATE_STOPPED;
  
  	os_mutex_init(&msc->list_and_timing_lock);
@@ -128,5 +128,5 @@ index be763d1c1..22c801f65 100644
  	//! @todo Make the clients not go from IDLE to READY before we have completed a first frame.
  	// Make sure there is at least some sort of valid frame data here.
 -- 
-2.50.1
+2.52.0
 

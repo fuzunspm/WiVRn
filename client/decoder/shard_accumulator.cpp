@@ -18,9 +18,9 @@
  */
 
 #include "shard_accumulator.h"
-#include "application.h"
-#include "scenes/stream.h"
+#include "scenes/stream.h" // IWYU pragma: keep
 #include "spdlog/spdlog.h"
+#include "xr/instance.h"
 
 namespace wivrn
 {
@@ -55,7 +55,7 @@ static bool is_complete(const shard_set & shards)
 	const auto & frame = shards.data;
 	if (frame.empty())
 		return false;
-	if (not(frame.back() and frame.back()->flags & video_stream_data_shard::end_of_frame))
+	if (not(frame.back() and frame.back()->timing_info))
 		return false;
 	for (const auto & shard: frame)
 		if (not shard)
@@ -63,10 +63,10 @@ static bool is_complete(const shard_set & shards)
 	return true;
 }
 
-std::optional<uint16_t> shard_set::insert(data_shard && shard)
+std::optional<uint16_t> shard_set::insert(data_shard && shard, xr::instance & instance)
 {
 	if (empty())
-		feedback.received_first_packet = application::now();
+		feedback.received_first_packet = instance.now();
 
 	auto idx = shard.shard_idx;
 	if (idx >= data.size())
@@ -99,7 +99,7 @@ static void debug_why_not_sent(const shard_set & shards)
 			++missing;
 	}
 
-	bool end = frame.back() and frame.back()->flags & video_stream_data_shard::end_of_frame;
+	bool end = frame.back() and frame.back()->timing_info;
 	spdlog::info("frame {} was not sent with {} data shards, {}{} missing", frame_idx, data, end ? "" : "at least ", missing);
 }
 
@@ -121,12 +121,12 @@ void shard_accumulator::push_shard(video_stream_data_shard && shard)
 	}
 	else if (frame_diff == 0)
 	{
-		auto shard_idx = current.insert(std::move(shard));
+		auto shard_idx = current.insert(std::move(shard), instance);
 		try_submit_frame(shard_idx);
 	}
 	else if (frame_diff == 1)
 	{
-		next.insert(std::move(shard));
+		next.insert(std::move(shard), instance);
 		if (is_complete(next))
 		{
 			debug_why_not_sent(current);
@@ -185,13 +185,13 @@ void shard_accumulator::try_submit_frame(uint16_t shard_idx)
 	for (size_t idx = shard_idx; idx < last_idx; ++idx)
 		payload.emplace_back(data_shards[idx]->payload);
 
-	bool frame_complete = last_idx == data_shards.size() and data_shards.back()->flags & video_stream_data_shard::end_of_frame;
-	decoder->push_data(payload, data_shards[shard_idx]->frame_idx, not frame_complete);
+	bool frame_complete = last_idx == data_shards.size() and data_shards.back()->timing_info;
+	decoder_->push_data(payload, data_shards[shard_idx]->frame_idx, not frame_complete);
 
 	if (not frame_complete)
 		return;
 
-	current.feedback.received_last_packet = application::now();
+	current.feedback.received_last_packet = instance.now();
 	current.feedback.sent_to_decoder = current.feedback.received_last_packet;
 	data_shard::timing_info_t timing_info = data_shards.back()->timing_info.value_or(data_shard::timing_info_t{});
 	current.feedback.encode_begin = timing_info.encode_begin;
@@ -206,7 +206,7 @@ void shard_accumulator::try_submit_frame(uint16_t shard_idx)
 	}
 
 	// Try to extract a frame
-	decoder->frame_completed(current.feedback, *data_shards.front()->view_info);
+	decoder_->frame_completed(current.feedback, *data_shards.front()->view_info);
 
 	send_feedback(current.feedback);
 
@@ -216,7 +216,7 @@ void shard_accumulator::try_submit_frame(uint16_t shard_idx)
 void shard_accumulator::send_feedback(wivrn::from_headset::feedback & feedback)
 {
 	if (not feedback.received_last_packet)
-		feedback.received_first_packet = application::now();
+		feedback.received_first_packet = instance.now();
 	auto scene = weak_scene.lock();
 	if (scene)
 		scene->send_feedback(feedback);

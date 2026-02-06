@@ -23,19 +23,12 @@
 #include "xr/session.h"
 #include <cassert>
 
-static PFN_xrDestroyHandTrackerEXT xrDestroyHandTrackerEXT{};
-
-XrResult xr::destroy_hand_tracker(XrHandTrackerEXT id)
+xr::hand_tracker::hand_tracker(instance & inst, session & session, const XrHandTrackerCreateInfoEXT & info) :
+        handle(inst.get_proc<PFN_xrDestroyHandTrackerEXT>("xrDestroyHandTrackerEXT"))
 {
-	return xrDestroyHandTrackerEXT(id);
-}
-
-xr::hand_tracker::hand_tracker(instance & inst, session & session, const XrHandTrackerCreateInfoEXT & info)
-{
-	static auto xrCreateHandTrackerEXT = inst.get_proc<PFN_xrCreateHandTrackerEXT>("xrCreateHandTrackerEXT");
+	auto xrCreateHandTrackerEXT = inst.get_proc<PFN_xrCreateHandTrackerEXT>("xrCreateHandTrackerEXT");
 	assert(xrCreateHandTrackerEXT);
 	xrLocateHandJointsEXT = inst.get_proc<PFN_xrLocateHandJointsEXT>("xrLocateHandJointsEXT");
-	xrDestroyHandTrackerEXT = inst.get_proc<PFN_xrDestroyHandTrackerEXT>("xrDestroyHandTrackerEXT");
 	CHECK_XR(xrCreateHandTrackerEXT(session, &info, &id));
 }
 
@@ -53,6 +46,14 @@ std::optional<std::array<xr::hand_tracker::joint, XR_HAND_JOINT_COUNT_EXT>> xr::
 
 	std::array<XrHandJointLocationEXT, XR_HAND_JOINT_COUNT_EXT> joints_pos;
 	std::array<XrHandJointVelocityEXT, XR_HAND_JOINT_COUNT_EXT> joints_vel;
+
+#ifndef NDEBUG
+	// Silence the OpenXR validation layer by setting valid flags
+	for (auto & i: joints_pos)
+		i.locationFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT;
+	for (auto & i: joints_vel)
+		i.velocityFlags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT;
+#endif
 
 	XrHandJointVelocitiesEXT velocities{
 	        .type = XR_TYPE_HAND_JOINT_VELOCITIES_EXT,

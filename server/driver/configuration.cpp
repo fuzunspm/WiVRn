@@ -64,6 +64,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(
                 {h265, "hevc"},
                 {av1, "av1"},
                 {av1, "AV1"},
+                {raw, "raw"},
         })
 
 NLOHMANN_JSON_SERIALIZE_ENUM(
@@ -139,11 +140,6 @@ configuration::encoder parse_encoder(const nlohmann::json & item)
 	if (item.contains(#property)) \
 		e.property = item[#property];
 
-	SET_IF(width);
-	SET_IF(height);
-	SET_IF(offset_x);
-	SET_IF(offset_y);
-	SET_IF(group);
 	SET_IF(codec);
 	if (e.codec == wivrn::video_codec(-1))
 		throw std::runtime_error("invalid codec value " + item["codec"].get<std::string>());
@@ -158,30 +154,29 @@ configuration::configuration()
 	{
 		auto json = read_configuration();
 
-		if (auto it = json.find("scale"); it != json.end())
-		{
-			if (it->is_number())
-				scale = std::array<double, 2>{*it, *it};
-			else
-				scale = *it;
-		}
-
 		if (auto it = json.find("grip-surface"); it != json.end())
 		{
 			grip_surface = *it;
 		}
 
-		if (auto it = json.find("bitrate"); it != json.end())
-			bitrate = *it;
-
-		if (auto it = json.find("encoders"); it != json.end())
+		if (auto it = json.find("encoder"); it != json.end())
 		{
-			for (const auto & encoder: *it)
-				encoders.push_back(parse_encoder(encoder));
+			if (it->is_array())
+			{
+				for (size_t i = 0; i < std::min(encoders.size(), it->size()); ++i)
+				{
+					encoders[i] = parse_encoder(it->at(i));
+				}
+			}
+			else if (it->is_string())
+			{
+				std::ranges::fill(encoders, encoder{.name = *it});
+			}
+			else
+			{
+				std::ranges::fill(encoders, parse_encoder(*it));
+			}
 		}
-
-		if (auto it = json.find("encoder-passthrough"); it != json.end())
-			encoder_passthrough = parse_encoder(*it);
 
 		if (auto it = json.find("application"); it != json.end())
 		{
@@ -194,6 +189,9 @@ configuration::configuration()
 			}
 		}
 
+		if (auto it = json.find("hid-forwarding"); it != json.end())
+			hid_forwarding = *it;
+
 		if (auto it = json.find("debug-gui"); it != json.end())
 			debug_gui = *it;
 
@@ -204,8 +202,6 @@ configuration::configuration()
 			bit_depth = *it;
 
 		if (auto it = json.find("tcp-only"); it != json.end())
-			tcp_only = *it;
-		else if (auto it = json.find("tcp_only"); it != json.end())
 			tcp_only = *it;
 
 		if (auto it = json.find("publish-service"); it != json.end())
@@ -292,9 +288,6 @@ std::optional<std::chrono::system_clock::time_point> from_iso8601(const std::str
 	tm t;
 	if (strptime(timestamp.c_str(), "%FT%H:%M:%S%z", &t) == nullptr)
 		return std::nullopt;
-
-	// Convert from local time to UTC
-	t.tm_sec += t.tm_gmtoff;
 
 	return std::chrono::system_clock::from_time_t(mktime(&t));
 }

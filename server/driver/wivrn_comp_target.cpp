@@ -23,12 +23,15 @@
 #include "encoder/video_encoder.h"
 #include "util/u_logging.h"
 #include "utils/scoped_lock.h"
+#include "wivrn_config.h"
 #include "wivrn_foveation.h"
 
 #include "main/comp_compositor.h"
 #include "math/m_space.h"
 #include "xrt_cast.h"
 
+#include <algorithm>
+#include <ranges>
 #include <vector>
 #include <vulkan/vulkan.hpp>
 #include <vulkan/vulkan_core.h>
@@ -58,6 +61,9 @@ std::vector<const char *> wivrn_comp_target::wanted_device_extensions = {
 #ifdef VK_KHR_video_encode_queue
         VK_KHR_VIDEO_ENCODE_QUEUE_EXTENSION_NAME,
 #endif
+#ifdef VK_KHR_video_maintenance1
+        VK_KHR_VIDEO_MAINTENANCE_1_EXTENSION_NAME,
+#endif
 #ifdef VK_KHR_video_encode_h264
         VK_KHR_VIDEO_ENCODE_H264_EXTENSION_NAME,
 #endif
@@ -75,10 +81,10 @@ static inline struct vk_bundle * get_vk(struct wivrn_comp_target * cn)
 	return &cn->c->base.vk;
 }
 
-static float get_default_rate(const from_headset::headset_info_packet & info)
+static float get_default_rate(const from_headset::headset_info_packet & info, const from_headset::settings_changed & settings)
 {
-	if (info.preferred_refresh_rate)
-		return info.preferred_refresh_rate;
+	if (settings.preferred_refresh_rate)
+		return settings.preferred_refresh_rate;
 	return info.available_refresh_rates.back();
 }
 
@@ -138,25 +144,17 @@ static void create_encoders(wivrn_comp_target * cn)
 	to_headset::video_stream_description & desc = cn->desc;
 	desc.width = cn->width;
 	desc.height = cn->height;
-	const auto & hmd = cn->cnx.get_hmd().hmd;
-	desc.defoveated_width = hmd->views[0].display.w_pixels * 2;
-	desc.defoveated_height = hmd->views[0].display.h_pixels;
 
 	std::map<int, std::vector<std::shared_ptr<video_encoder>>> thread_params;
 
-	uint32_t bitrate = 0;
-
-	for (auto & settings: cn->settings)
+	for (auto [i, settings]: std::ranges::enumerate_view(cn->settings))
 	{
-		bitrate += settings.bitrate;
-		uint8_t stream_index = cn->encoders.size();
 		auto & encoder = cn->encoders.emplace_back(
-		        video_encoder::create(*cn->wivrn_bundle, settings, stream_index, desc.width, desc.height, desc.fps));
-		desc.items.push_back(settings);
+		        video_encoder::create(*cn->wivrn_bundle, settings, i));
+		desc.codec[i] = settings.codec;
 
 		thread_params[settings.group].emplace_back(encoder);
 	}
-	wivrn_ipc_socket_monado->send(from_monado::bitrate_changed{bitrate});
 
 	for (auto & [group, params]: thread_params)
 	{
@@ -188,56 +186,51 @@ static VkResult create_images(struct wivrn_comp_target * cn, vk::ImageUsageFlags
 
 	cn->images = U_TYPED_ARRAY_CALLOC(struct comp_target_image, cn->image_count);
 
-#if WIVRN_USE_VULKAN_ENCODE
-	auto [video_profiles, encoder_flags] = video_encoder::get_create_image_info(cn->settings);
-
-	vk::VideoProfileListInfoKHR video_profile_list{
-	        .profileCount = uint32_t(video_profiles.size()),
-	        .pProfiles = video_profiles.data(),
+	vk::StructureChain image_info{
+	        vk::ImageCreateInfo{
+	                .flags = vk::ImageCreateFlagBits::eExtendedUsage | vk::ImageCreateFlagBits::eMutableFormat,
+	                .imageType = vk::ImageType::e2D,
+	                .format = format,
+	                .extent = {
+	                        .width = cn->width,
+	                        .height = cn->height,
+	                        .depth = 1,
+	                },
+	                .mipLevels = 1,
+	                .arrayLayers = 3, // left, right then alpha
+	                .samples = vk::SampleCountFlagBits::e1,
+	                .tiling = vk::ImageTiling::eOptimal,
+	                .usage = flags | vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc,
+	                .sharingMode = vk::SharingMode::eExclusive,
+	        },
+	        vk::ImageFormatListCreateInfo{
+	                .viewFormatCount = formats.size(),
+	                .pViewFormats = formats.data(),
+	        },
 	};
+#if WIVRN_USE_VULKAN_ENCODE
+	if (
+	        vk->features.video_maintenance_1 and
+	        std::ranges::contains(
+	                cn->settings,
+	                encoder_vulkan,
+	                &encoder_settings::encoder_name))
+	{
+		image_info.get().flags |= vk::ImageCreateFlagBits::eVideoProfileIndependentKHR;
+		image_info.get().usage |= vk::ImageUsageFlagBits::eVideoEncodeSrcKHR;
+	}
 #endif
 
 	cn->psc.images.resize(cn->image_count);
 	for (uint32_t i = 0; i < cn->image_count; i++)
 	{
-		vk::ImageFormatListCreateInfo formats_info{
-		        .viewFormatCount = formats.size(),
-		        .pViewFormats = formats.data(),
-		};
-
-#if WIVRN_USE_VULKAN_ENCODE
-		if (video_profile_list.profileCount)
-			formats_info.pNext = &video_profile_list;
-#endif
-
 		auto & image = cn->psc.images[i].image;
 		image = image_allocation(
-		        device, {
-		                        .pNext = &formats_info,
-		                        .flags = vk::ImageCreateFlagBits::eExtendedUsage | vk::ImageCreateFlagBits::eMutableFormat,
-		                        .imageType = vk::ImageType::e2D,
-		                        .format = format,
-		                        .extent = {
-		                                .width = cn->width,
-		                                .height = cn->height,
-		                                .depth = 1,
-		                        },
-		                        .mipLevels = 1,
-		                        .arrayLayers = 2, // colour then alpha
-		                        .samples = vk::SampleCountFlagBits::e1,
-		                        .tiling = vk::ImageTiling::eOptimal,
-		                        .usage = flags
-#if WIVRN_USE_VULKAN_ENCODE
-		                                 | encoder_flags
-#endif
-		                                 | vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc,
-		                        .sharingMode = vk::SharingMode::eExclusive,
-		                },
-		        {
-		                .usage = VMA_MEMORY_USAGE_AUTO,
-		        });
+		        device,
+		        image_info.get(),
+		        {.usage = VMA_MEMORY_USAGE_AUTO},
+		        std::format("comp target image {}", i));
 		cn->images[i].handle = image;
-		cn->wivrn_bundle->name(vk::Image(image), "comp target image");
 	}
 
 	for (uint32_t i = 0; i < cn->image_count; i++)
@@ -255,7 +248,7 @@ static VkResult create_images(struct wivrn_comp_target * cn, vk::ImageUsageFlags
 		                                                .subresourceRange = {
 		                                                        .aspectMask = vk::ImageAspectFlagBits::ePlane0,
 		                                                        .levelCount = 1,
-		                                                        .layerCount = 2,
+		                                                        .layerCount = vk::RemainingArrayLayers,
 		                                                },
 		                                        });
 		item.image_view_cbcr = vk::raii::ImageView(device,
@@ -267,7 +260,7 @@ static VkResult create_images(struct wivrn_comp_target * cn, vk::ImageUsageFlags
 		                                                   .subresourceRange = {
 		                                                           .aspectMask = vk::ImageAspectFlagBits::ePlane1,
 		                                                           .levelCount = 1,
-		                                                           .layerCount = 2,
+		                                                           .layerCount = vk::RemainingArrayLayers,
 		                                                   },
 		                                           });
 		cn->images[i].view = VkImageView(*item.image_view_y);
@@ -305,7 +298,7 @@ static bool comp_wivrn_init_post_vulkan(struct comp_target * ct, uint32_t prefer
 		        cn->wivrn_bundle->device,
 		        {
 		                .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
-		                .queueFamilyIndex = vk->queue_family_index,
+		                .queueFamilyIndex = vk->main_queue->family_index,
 		        });
 		cn->wivrn_bundle->name(cn->command_pool, "comp target command pool");
 	}
@@ -319,13 +312,19 @@ static bool comp_wivrn_init_post_vulkan(struct comp_target * ct, uint32_t prefer
 	{
 		cn->settings = get_encoder_settings(
 		        *cn->wivrn_bundle,
-		        cn->c->settings.preferred.width,
-		        cn->c->settings.preferred.height,
-		        cn->cnx.get_info());
+		        cn->cnx.get_info(),
+		        *cn->cnx.get_settings());
 		print_encoders(cn->settings);
+
+		cn->c->settings.preferred.width = cn->settings[0].width;
+		cn->c->settings.preferred.height = cn->settings[0].height;
 	}
 	catch (const std::exception & e)
 	{
+		wivrn_ipc_socket_monado->send(from_monado::server_error{
+		        .where = "Error creating encoder",
+		        .message = e.what(),
+		});
 		U_LOG_E("Failed to create video encoder: %s", e.what());
 		return false;
 	}
@@ -483,6 +482,23 @@ static void comp_wivrn_present_thread(std::stop_token stop_token, wivrn_comp_tar
 
 		auto res = vk.device.waitForFences(*cn->psc.fence, true, UINT64_MAX);
 
+		try
+		{
+			for (auto & encoder: encoders)
+			{
+				if (encoder->stream_idx < 2 or view_info.alpha)
+					encoder->encode(cn->cnx, view_info, frame_index);
+			}
+		}
+		catch (std::exception & e)
+		{
+			U_LOG_W("encode error: %s", e.what());
+		}
+		catch (...)
+		{
+			// Ignore errors
+		}
+
 		// Update encoder status, release image
 		if ((cn->psc.status &= ~status_bit) == 0)
 		{
@@ -495,23 +511,6 @@ static void comp_wivrn_present_thread(std::stop_token stop_token, wivrn_comp_tar
 					break;
 				}
 			}
-		}
-
-		try
-		{
-			for (auto & encoder: encoders)
-			{
-				if (encoder->channels == to_headset::video_stream_description::channels_t::colour or view_info.alpha)
-					encoder->encode(cn->cnx, view_info, frame_index);
-			}
-		}
-		catch (std::exception & e)
-		{
-			U_LOG_W("encode error: %s", e.what());
-		}
-		catch (...)
-		{
-			// Ignore errors
 		}
 	}
 }
@@ -541,7 +540,7 @@ static VkResult comp_wivrn_present(struct comp_target * ct,
 
 	if (cn->c->base.layer_accum.layer_count == 0 or not cn->cnx.get_offset())
 	{
-		scoped_lock lock(vk->queue_mutex);
+		scoped_lock lock(vk->main_queue->mutex);
 		cn->wivrn_bundle->queue.submit(submit_info);
 		cn->psc.images[index].status = pseudo_swapchain::status_t::free;
 		return VK_SUCCESS;
@@ -568,7 +567,7 @@ static VkResult comp_wivrn_present(struct comp_target * ct,
 	std::vector<vk::Semaphore> present_done_sem;
 	for (auto & encoder: cn->encoders)
 	{
-		if (encoder->channels == to_headset::video_stream_description::channels_t::alpha and not do_alpha)
+		if (encoder->stream_idx == 2 and not do_alpha)
 			continue;
 		auto [transfer, sem] = encoder->present_image(psc_image.image, command_buffer, info.frame_id);
 		need_queue_transfer |= transfer;
@@ -584,14 +583,14 @@ static VkResult comp_wivrn_present(struct comp_target * ct,
 		        .dstAccessMask = vk::AccessFlagBits::eMemoryWrite,
 		        .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
 		        .newLayout = vk::ImageLayout::eVideoEncodeSrcKHR,
-		        .srcQueueFamilyIndex = vk->queue_family_index,
-		        .dstQueueFamilyIndex = vk->encode_queue_family_index,
+		        .srcQueueFamilyIndex = vk->main_queue->family_index,
+		        .dstQueueFamilyIndex = vk->encode_queue->family_index,
 		        .image = psc_image.image,
 		        .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
 		                             .baseMipLevel = 0,
 		                             .levelCount = 1,
 		                             .baseArrayLayer = 0,
-		                             .layerCount = 2},
+		                             .layerCount = vk::RemainingArrayLayers},
 		};
 		command_buffer.pipelineBarrier(
 		        vk::PipelineStageFlagBits::eTransfer,
@@ -607,11 +606,11 @@ static VkResult comp_wivrn_present(struct comp_target * ct,
 	submit_info.setCommandBuffers(*command_buffer);
 
 	{
-		scoped_lock lock(vk->queue_mutex);
+		scoped_lock lock(vk->main_queue->mutex);
 		cn->wivrn_bundle->queue.submit(submit_info, *cn->psc.fence);
 		for (auto & encoder: cn->encoders)
 		{
-			if (encoder->channels == to_headset::video_stream_description::channels_t::alpha and not do_alpha)
+			if (encoder->stream_idx == 2 and not do_alpha)
 				continue;
 			encoder->post_submit();
 		}
@@ -711,7 +710,7 @@ static void comp_wivrn_flush(struct comp_target * ct)
 	};
 
 	{
-		scoped_lock lock(vk->queue_mutex);
+		scoped_lock lock(vk->main_queue->mutex);
 		cn->wivrn_bundle->queue.submit(submit_info);
 	}
 }
@@ -790,7 +789,7 @@ static xrt_result_t comp_wivrn_request_refresh_rate(struct comp_target * ct, flo
 	struct wivrn_comp_target * cn = (struct wivrn_comp_target *)ct;
 	cn->requested_refresh_rate = refresh_rate_hz;
 	if (refresh_rate_hz == 0.0f)
-		refresh_rate_hz = get_default_rate(cn->cnx.get_info());
+		refresh_rate_hz = get_default_rate(cn->cnx.get_info(), *cn->cnx.get_settings());
 
 	cn->cnx.send_control(to_headset::refresh_rate_change{.fps = refresh_rate_hz});
 	return XRT_SUCCESS;
@@ -815,14 +814,14 @@ static void comp_wivrn_info_gpu(struct comp_target * ct, int64_t frame_id, int64
 
 void wivrn_comp_target::on_feedback(const from_headset::feedback & feedback, const clock_offset & o)
 {
-	if (not o)
-		return;
 	uint8_t stream = feedback.stream_index;
 	if (psc.status & 1)
 		return;
 	if (encoders.size() <= stream)
 		return;
 	encoders[stream]->on_feedback(feedback);
+	if (not o)
+		return;
 	pacer.on_feedback(feedback, o);
 }
 
@@ -834,12 +833,11 @@ void wivrn_comp_target::reset_encoders()
 	cnx.send_control(to_headset::video_stream_description{desc});
 }
 
-void wivrn_comp_target::set_bitrate(int bitrate_bps)
+void wivrn_comp_target::set_bitrate(uint32_t bitrate_bps)
 {
 	for (auto & encoder: encoders)
 	{
-		// Alpha will have multiplier of 0 and will be left unchanged.
-		auto encoder_bps = (int)(bitrate_bps * encoder->bitrate_multiplier);
+		auto encoder_bps = (uint32_t)(bitrate_bps * encoder->bitrate_multiplier);
 		U_LOG_D("Encoder %d bitrate: %d", encoder->stream_idx, encoder_bps);
 		encoder->set_bitrate(encoder_bps);
 	}
@@ -876,7 +874,7 @@ wivrn_comp_target::wivrn_comp_target(wivrn::wivrn_session & cnx, struct comp_com
                 .request_refresh_rate = comp_wivrn_request_refresh_rate,
                 .destroy = comp_wivrn_destroy,
         },
-        desc{.fps = get_default_rate(cnx.get_info())},
+        desc{.fps = get_default_rate(cnx.get_info(), *cnx.get_settings())},
         pacer(U_TIME_1S_IN_NS / desc.fps),
         cnx(cnx)
 {

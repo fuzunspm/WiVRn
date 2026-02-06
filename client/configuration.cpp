@@ -19,6 +19,8 @@
 
 #include "configuration.h"
 #include "application.h"
+#include "utils/json_string.h"
+#include "wivrn_packets.h"
 
 #include <fstream>
 #include <magic_enum.hpp>
@@ -27,60 +29,12 @@
 #include "android/permissions.h"
 #endif
 
-static std::string json_string(const std::string & in)
-{
-	std::string out;
-	out.reserve(in.size() + 2);
-
-	out += '"';
-
-	for (char c: in)
-	{
-		switch (c)
-		{
-			case '\b':
-				out += "\\b";
-				break;
-
-			case '\f':
-				out += "\\f";
-				break;
-
-			case '\n':
-				out += "\\n";
-				break;
-
-			case '\r':
-				out += "\\r";
-				break;
-
-			case '\t':
-				out += "\\t";
-				break;
-
-			case '"':
-				out += "\\\"";
-				break;
-
-			case '\\':
-				out += "\\\\";
-				break;
-
-			default:
-				out += c;
-				break;
-		}
-	}
-
-	out += '"';
-
-	return out;
-}
-
 bool configuration::check_feature(feature f) const
 {
 	{
 		std::lock_guard lock(mutex);
+
+		auto & system = application::get_system();
 
 		auto it = features.find(f);
 		if (it == features.end())
@@ -94,7 +48,7 @@ bool configuration::check_feature(feature f) const
 			case feature::microphone:
 				break;
 			case feature::hand_tracking:
-				if (not application::get_hand_tracking_supported())
+				if (not system.hand_tracking_supported())
 					return false;
 				break;
 			case feature::eye_gaze:
@@ -102,50 +56,12 @@ bool configuration::check_feature(feature f) const
 					return false;
 				break;
 			case feature::face_tracking:
-				switch (guess_model())
-				{
-					case model::htc_vive_focus_3:
-					case model::htc_vive_focus_vision:
-					case model::htc_vive_xr_elite:
-						if (not std::holds_alternative<xr::htc_face_tracker>(application::get_face_tracker()))
-							return false;
-						break;
-					case model::pico_4_pro:
-					case model::pico_4_enterprise:
-						if (not std::holds_alternative<xr::pico_face_tracker>(application::get_face_tracker()))
-							return false;
-						break;
-					default:
-						if (not std::holds_alternative<xr::fb_face_tracker2>(application::get_face_tracker()))
-							return false;
-						break;
-				}
+				if (system.face_tracker_supported() == xr::face_tracker_type::none)
+					return false;
 				break;
 			case feature::body_tracking:
-				switch (guess_model())
-				{
-					case model::meta_quest_3:
-					case model::meta_quest_3s:
-						if (not std::holds_alternative<xr::fb_body_tracker>(application::get_body_tracker()))
-							return false;
-						break;
-					case model::htc_vive_focus_3:
-					case model::htc_vive_xr_elite:
-					case model::htc_vive_focus_vision:
-						if (not std::holds_alternative<xr::htc_body_tracker>(application::get_body_tracker()))
-							return false;
-						break;
-					case model::pico_neo_3:
-					case model::pico_4:
-					case model::pico_4s:
-					case model::pico_4_pro:
-					case model::pico_4_enterprise:
-						if (not std::holds_alternative<xr::pico_body_tracker>(application::get_body_tracker()))
-							return false;
-						break;
-					default:
-						break;
-				}
+				if (system.body_tracker_supported() == xr::body_tracker_type::none)
+					return false;
 				break;
 		}
 	}
@@ -181,12 +97,35 @@ void configuration::set_feature(feature f, bool state)
 
 configuration::configuration(xr::system & system)
 {
-	passthrough_enabled = system.passthrough_supported() == xr::system::passthrough_type::color;
-	features[feature::hand_tracking] = application::get_hand_tracking_supported();
+	passthrough_enabled = system.passthrough_supported() == xr::passthrough_type::color;
+	features[feature::hand_tracking] = system.hand_tracking_supported();
+	switch (guess_model())
+	{
+		case model::oculus_quest:
+		case model::oculus_quest_2:
+		case model::meta_quest_pro:
+		case model::meta_quest_3:
+		case model::meta_quest_3s:
+			high_power_mode = false;
+			break;
+		case model::pico_neo_3:
+		case model::pico_4:
+		case model::pico_4s:
+		case model::pico_4_pro:
+		case model::pico_4_enterprise:
+		case model::htc_vive_focus_3:
+		case model::htc_vive_xr_elite:
+		case model::htc_vive_focus_vision:
+		case model::lynx_r1:
+		case model::samsung_galaxy_xr:
+		case model::unknown:
+			high_power_mode = true;
+			break;
+	}
 	try
 	{
 		simdjson::dom::parser parser;
-		simdjson::dom::element root = parser.load(application::get_config_path() / "client.json");
+		simdjson::dom::element root = parser.load((application::get_config_path() / "client.json").native());
 		for (simdjson::dom::object i: simdjson::dom::array(root["servers"]))
 		{
 			server_data data{
@@ -214,8 +153,29 @@ configuration::configuration(xr::system & system)
 		if (auto val = root["resolution_scale"]; val.is_double())
 			resolution_scale = val.get_double();
 
-		if (auto val = root["sgsr"]; val.is_object())
-			parse_sgsr_options(val.get_object());
+		if (auto val = root["stream_scale"]; val.is_double())
+			stream_scale = val.get_double();
+
+		if (auto val = root["codec"]; val.is_string())
+		{
+			const auto codec_str = val.get_string().value();
+			for (const auto & [c, name]: magic_enum::enum_entries<wivrn::video_codec>())
+			{
+				if (codec_str == name)
+				{
+					codec = c;
+				}
+			}
+		}
+
+		if (auto val = root["bit_depth"]; val.is_uint64())
+			bit_depth = val.get_uint64();
+
+		if (auto val = root["bitrate_bps"]; val.is_number())
+			bitrate_bps = val.get_uint64();
+
+		if (auto val = root["enable_stream_gui"]; val.is_bool())
+			enable_stream_gui = val.get_bool();
 
 		if (auto val = root["openxr_post_processing"]; val.is_object())
 			parse_openxr_post_processing_options(val.get_object());
@@ -240,7 +200,7 @@ configuration::configuration(xr::system & system)
 				features[i] = val.get_bool();
 		}
 
-		if (system.passthrough_supported() == xr::system::passthrough_type::no_passthrough)
+		if (system.passthrough_supported() == xr::passthrough_type::none)
 			passthrough_enabled = false;
 
 		if (auto val = root["override_foveation_enable"]; val.is_bool())
@@ -254,39 +214,23 @@ configuration::configuration(xr::system & system)
 
 		if (auto val = root["first_run"]; val.is_bool())
 			first_run = val.get_bool();
+
+		if (auto val = root["locale"]; val.is_string())
+			locale = val.get_string().value();
+
+		if (auto val = root["environment_model"]; val.is_string())
+			environment_model = (std::string_view)val.get_string();
+
+		if (auto val = root["high_power_mode"]; val.is_bool())
+			high_power_mode = val.get_bool();
+
+		if (auto val = root["extended_config"]; val.is_bool())
+			extended_config = val.get_bool();
 	}
 	catch (std::exception & e)
 	{
 		spdlog::warn("Cannot read configuration: {}", e.what());
-
-		// Restore default configuration
-		servers.clear();
-		preferred_refresh_rate.reset();
-		minimum_refresh_rate.reset();
-		resolution_scale = 1.4;
-		sgsr = {};
-		openxr_post_processing = {};
-		passthrough_enabled = system.passthrough_supported() == xr::system::passthrough_type::color;
 	}
-}
-
-void configuration::parse_sgsr_options(simdjson::simdjson_result<simdjson::dom::object> sgsr_root)
-{
-	sgsr = {};
-	if (auto val = sgsr_root["enabled"]; val.is_bool())
-		sgsr.enabled = val.get_bool();
-
-	if (auto val = sgsr_root["upscaling_factor"]; val.is_double())
-		sgsr.upscaling_factor = val.get_double();
-
-	if (auto val = sgsr_root["use_edge_direction"]; val.is_bool())
-		sgsr.use_edge_direction = val.get_bool();
-
-	if (auto val = sgsr_root["edge_threshold"]; val.is_double())
-		sgsr.edge_threshold = val.get_double();
-
-	if (auto val = sgsr_root["edge_sharpness"]; val.is_double())
-		sgsr.edge_sharpness = val.get_double();
 }
 
 void configuration::parse_openxr_post_processing_options(simdjson::simdjson_result<simdjson::dom::object> openxr_post_processing_root)
@@ -302,17 +246,6 @@ void configuration::parse_openxr_post_processing_options(simdjson::simdjson_resu
 static std::ostream & operator<<(std::ostream & stream, feature f)
 {
 	return stream << "\"" << magic_enum::enum_name(f) << "\"";
-}
-
-static std::ostream & write_sgsr(std::ofstream & stream, const configuration::sgsr_settings & sgsr)
-{
-	stream << "{\"enabled\":" << std::boolalpha << sgsr.enabled;
-	stream << ",\"upscaling_factor\":" << sgsr.upscaling_factor;
-	stream << ",\"use_edge_direction\":" << std::boolalpha << sgsr.use_edge_direction;
-	stream << ",\"edge_threshold\":" << sgsr.edge_threshold;
-	stream << ",\"edge_sharpness\":" << sgsr.edge_sharpness;
-	stream << "}";
-	return stream;
 }
 
 static std::ostream & write_openxr_post_processing(std::ofstream & stream, const configuration::openxr_post_processing_settings & openxr_post_processing)
@@ -357,14 +290,19 @@ void configuration::save()
 	if (minimum_refresh_rate)
 		json << ",\"minimum_refresh_rate\":" << *minimum_refresh_rate;
 	json << ",\"resolution_scale\":" << resolution_scale;
-	json << ",\"sgsr\":";
-	write_sgsr(json, sgsr);
+	if (stream_scale)
+		json << ",\"stream_scale\":" << *stream_scale;
+	if (codec)
+		json << ",\"codec\":" << json_string(magic_enum::enum_name(*codec));
+	json << ",\"bit_depth\":" << (uint64_t)bit_depth;
+	json << ",\"bitrate_bps\":" << bitrate_bps;
 	json << ",\"openxr_post_processing\":";
 	write_openxr_post_processing(json, openxr_post_processing);
 	json << ",\"passthrough_enabled\":" << std::boolalpha << passthrough_enabled;
 	json << ",\"mic_unprocessed_audio\":" << std::boolalpha << mic_unprocessed_audio;
 	json << ",\"fb_lower_body\":" << std::boolalpha << fb_lower_body;
 	json << ",\"fb_hip\":" << std::boolalpha << fb_hip;
+	json << ",\"enable_stream_gui\":" << std::boolalpha << enable_stream_gui;
 	for (auto & [key, value]: features)
 		json << "," << key << ":" << std::boolalpha << value;
 	json << ",\"virtual_keyboard_layout\":" << json_string(virtual_keyboard_layout);
@@ -372,5 +310,23 @@ void configuration::save()
 	json << ",\"override_foveation_pitch\":" << override_foveation_pitch;
 	json << ",\"override_foveation_distance\":" << override_foveation_distance;
 	json << ",\"first_run\":" << std::boolalpha << first_run;
+	json << ",\"locale\":" << json_string(locale);
+	json << ",\"environment_model\":" << json_string(environment_model);
+	json << ",\"high_power_mode\":" << std::boolalpha << high_power_mode;
+	json << ",\"extended_config\":" << std::boolalpha << extended_config;
 	json << "}";
+}
+
+void configuration::set_stream_scale(float val)
+{
+	stream_scale = val;
+}
+
+float configuration::get_stream_scale() const
+{
+	if (stream_scale)
+		return *stream_scale;
+	if (check_feature(feature::eye_gaze))
+		return 0.3;
+	return 0.5;
 }

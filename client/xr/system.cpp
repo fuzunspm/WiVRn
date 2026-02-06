@@ -19,12 +19,14 @@
 
 #include "system.h"
 
-#include "application.h"
+#include "body_tracker.h"
 #include "details/enumerate.h"
+#include "face_tracker.h"
 #include "openxr/openxr.h"
 #include "utils/contains.h"
 #include "vk/check.h"
 #include "xr/check.h"
+#include "xr/instance.h"
 #include <cassert>
 #include <openxr/openxr_platform.h>
 
@@ -41,6 +43,12 @@ xr::system::system(xr::instance & inst, XrFormFactor formfactor)
 	CHECK_XR(xrGetSystem(inst, &system_info, &id));
 
 	assert(id != XR_NULL_SYSTEM_ID);
+
+	if (inst.has_extension(XR_EXT_HAND_TRACKING_EXTENSION_NAME))
+		hand_tracking_supported_ = hand_tracking_properties().supportsHandTracking;
+
+	body_tracker = xr::body_tracker_supported(inst, *this);
+	face_tracker = xr::face_tracker_supported(inst, *this);
 }
 
 XrGraphicsRequirementsVulkan2KHR xr::system::graphics_requirements() const
@@ -123,6 +131,24 @@ XrSystemUserPresencePropertiesEXT xr::system::user_presence_properties() const
 	return presence_prop;
 }
 
+XrSystemFaceTrackingPropertiesANDROID xr::system::android_face_tracking_properties() const
+{
+	if (!id)
+		throw std::invalid_argument("this");
+
+	XrSystemFaceTrackingPropertiesANDROID face_tracking_prop{
+	        .type = XR_TYPE_SYSTEM_FACE_TRACKING_PROPERTIES_ANDROID,
+	};
+
+	XrSystemProperties prop{
+	        .type = XR_TYPE_SYSTEM_PROPERTIES,
+	        .next = &face_tracking_prop,
+	};
+	CHECK_XR(xrGetSystemProperties(*inst, id, &prop));
+
+	return face_tracking_prop;
+}
+
 XrSystemFaceTrackingProperties2FB xr::system::fb_face_tracking2_properties() const
 {
 	if (!id)
@@ -195,16 +221,15 @@ XrSystemBodyTrackingPropertiesBD xr::system::bd_body_tracking_properties() const
 	return body_tracking_prop;
 }
 
-xr::system::passthrough_type xr::system::passthrough_supported() const
+xr::passthrough_type xr::system::passthrough_supported() const
 {
 	if (utils::contains(environment_blend_modes(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO), XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND))
 		return passthrough_type::color;
 
-	const std::vector<std::string> & xr_extensions = application::get_xr_extensions();
-	if (utils::contains(xr_extensions, XR_HTC_PASSTHROUGH_EXTENSION_NAME))
+	if (inst->has_extension(XR_HTC_PASSTHROUGH_EXTENSION_NAME))
 		return passthrough_type::color;
 
-	if (utils::contains(xr_extensions, XR_FB_PASSTHROUGH_EXTENSION_NAME))
+	if (inst->has_extension(XR_FB_PASSTHROUGH_EXTENSION_NAME))
 	{
 		XrSystemPassthroughProperties2FB passthrough_prop2{
 		        .type = XR_TYPE_SYSTEM_PASSTHROUGH_PROPERTIES2_FB,
@@ -224,7 +249,7 @@ xr::system::passthrough_type xr::system::passthrough_supported() const
 		if (passthrough_prop.supportsPassthrough)
 		{
 			if (!(passthrough_prop2.capabilities & XR_PASSTHROUGH_CAPABILITY_BIT_FB))
-				return passthrough_type::no_passthrough;
+				return passthrough_type::none;
 
 			if (passthrough_prop2.capabilities & XR_PASSTHROUGH_CAPABILITY_COLOR_BIT_FB)
 				return passthrough_type::color;
@@ -233,7 +258,21 @@ xr::system::passthrough_type xr::system::passthrough_supported() const
 		}
 	}
 
-	return passthrough_type::no_passthrough;
+	return passthrough_type::none;
+}
+xr::face_tracker_type xr::system::face_tracker_supported() const
+{
+	return face_tracker;
+}
+
+xr::body_tracker_type xr::system::body_tracker_supported() const
+{
+	return body_tracker;
+}
+
+bool xr::system::hand_tracking_supported() const
+{
+	return hand_tracking_supported_;
 }
 
 vk::raii::PhysicalDevice xr::system::physical_device(vk::raii::Instance & vulkan) const

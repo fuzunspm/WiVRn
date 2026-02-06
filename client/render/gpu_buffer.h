@@ -20,6 +20,7 @@
 
 #include "application.h"
 #include "utils/alignment.h"
+#include "utils/contains.h"
 #include "vk/allocation.h"
 #include <fastgltf/tools.hpp>
 #include <fastgltf/types.hpp>
@@ -30,6 +31,8 @@ class gpu_buffer
 {
 	std::vector<std::byte> bytes;
 	vk::PhysicalDeviceLimits limits;
+	vk::PhysicalDeviceIndexTypeUint8FeaturesEXT feat_uint8;
+
 	fastgltf::Asset & asset;
 	vk::BufferUsageFlags usage;
 
@@ -59,8 +62,15 @@ class gpu_buffer
 	}
 
 public:
-	gpu_buffer(vk::PhysicalDeviceProperties properties, fastgltf::Asset & asset) :
-	        limits(properties.limits), asset(asset), usage(0) {}
+	gpu_buffer(vk::raii::PhysicalDevice physical_device, fastgltf::Asset & asset) :
+	        asset(asset),
+	        usage(0)
+	{
+		limits = physical_device.getProperties().limits;
+
+		if (utils::contains(application::instance().get_vk_device_extensions(), VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME))
+			std::tie(std::ignore, feat_uint8) = physical_device.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceIndexTypeUint8FeaturesEXT>();
+	}
 
 	template <typename T>
 	size_t add_uniform(const T & data_to_add)
@@ -80,7 +90,7 @@ public:
 		return add(alignment, data_to_add);
 	}
 
-	size_t add_indices(const fastgltf::Accessor & accessor)
+	std::pair<size_t, vk::IndexType> add_indices(const fastgltf::Accessor & accessor)
 	{
 		usage |= vk::BufferUsageFlagBits::eIndexBuffer;
 
@@ -91,7 +101,11 @@ public:
 				std::vector<uint8_t> indices(accessor.count);
 				using index_t = std::remove_cvref_t<decltype(*indices.data())>;
 				fastgltf::copyFromAccessor<index_t>(asset, accessor, indices.data());
-				return add(4, indices);
+
+				if (feat_uint8.indexTypeUint8)
+					return {add(4, indices), vk::IndexType::eUint8EXT};
+				else
+					return {add(4, std::vector<uint16_t>{indices.begin(), indices.end()}), vk::IndexType::eUint16};
 			}
 
 			case fastgltf::ComponentType::Short:
@@ -99,7 +113,7 @@ public:
 				std::vector<uint16_t> indices(accessor.count);
 				using index_t = std::remove_cvref_t<decltype(*indices.data())>;
 				fastgltf::copyFromAccessor<index_t>(asset, accessor, indices.data());
-				return add(4, indices);
+				return {add(4, indices), vk::IndexType::eUint16};
 			}
 
 			case fastgltf::ComponentType::Int:
@@ -107,7 +121,7 @@ public:
 				std::vector<uint32_t> indices(accessor.count);
 				using index_t = std::remove_cvref_t<decltype(*indices.data())>;
 				fastgltf::copyFromAccessor<index_t>(asset, accessor, indices.data());
-				return add(4, indices);
+				return {add(4, indices), vk::IndexType::eUint32};
 			}
 
 			default:
@@ -115,10 +129,10 @@ public:
 		}
 	}
 
-	buffer_allocation copy_to_gpu()
+	buffer_allocation copy_to_gpu(vk::raii::Device & device)
 	{
 		buffer_allocation gpu_buffer{
-		        application::get_device(),
+		        device,
 		        vk::BufferCreateInfo{
 		                .size = bytes.size(),
 		                .usage = usage},

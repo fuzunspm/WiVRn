@@ -122,6 +122,23 @@ public:
 	}
 };
 
+class serverErrorData
+{
+	Q_GADGET
+	QML_VALUE_TYPE(serverError)
+
+	Q_PROPERTY(QString where MEMBER m_where CONSTANT)
+	Q_PROPERTY(QString message MEMBER m_message CONSTANT)
+
+	QString m_where;
+	QString m_message;
+
+public:
+	serverErrorData() = default;
+	serverErrorData(QString where, QString message) :
+	        m_where(where), m_message(message) {}
+};
+
 class wivrn_server : public QObject
 {
 	Q_OBJECT
@@ -134,7 +151,6 @@ class wivrn_server : public QObject
 	std::unique_ptr<QDBusPendingCallWatcher> get_all_properties_call_watcher;
 
 	QProcess * server_process = nullptr;
-	std::unique_ptr<QProcess> setcap_process;
 
 public:
 	wivrn_server(QObject * parent = nullptr);
@@ -156,14 +172,13 @@ public:
 
 	// Server information
 	Q_PROPERTY(Status serverStatus READ serverStatus NOTIFY serverStatusChanged)
-	Q_PROPERTY(bool capSysNice READ capSysNice NOTIFY capSysNiceChanged)
 	Q_PROPERTY(bool headsetConnected READ isHeadsetConnected NOTIFY headsetConnectedChanged)
+	Q_PROPERTY(bool sessionRunning READ isSessionRunning NOTIFY sessionRunningChanged)
 	Q_PROPERTY(QString jsonConfiguration READ jsonConfiguration WRITE setJsonConfiguration NOTIFY jsonConfigurationChanged)
 	Q_PROPERTY(QString serverLogs READ serverLogs NOTIFY serverLogsChanged)
 	Q_INVOKABLE void start_server();
 	Q_INVOKABLE void stop_server();
 	Q_INVOKABLE void restart_server();
-	Q_INVOKABLE void grant_cap_sys_nice();
 	Q_INVOKABLE void open_server_logs();
 
 	// Authentication
@@ -189,6 +204,7 @@ public:
 	Q_PROPERTY(int speakerChannels READ speakerChannels NOTIFY speakerChannelsChanged)
 	Q_PROPERTY(int speakerSampleRate READ speakerSampleRate NOTIFY speakerSampleRateChanged)
 	Q_PROPERTY(QStringList supportedCodecs READ supportedCodecs NOTIFY supportedCodecsChanged)
+	Q_PROPERTY(QString systemName READ systemName NOTIFY systemNameChanged)
 	Q_PROPERTY(QString steamCommand READ steamCommand NOTIFY steamCommandChanged)
 
 	// hostnamed
@@ -205,14 +221,14 @@ public:
 		return m_serverStatus;
 	}
 
-	bool capSysNice() const
-	{
-		return m_capSysNice;
-	}
-
 	bool isHeadsetConnected() const
 	{
 		return m_headsetConnected;
+	}
+
+	bool isSessionRunning() const
+	{
+		return m_sessionRunning;
 	}
 
 	QString jsonConfiguration() const
@@ -302,6 +318,11 @@ public:
 		return m_supportedCodecs;
 	}
 
+	QString systemName() const
+	{
+		return m_systemName;
+	}
+
 	QString steamCommand() const
 	{
 		return m_steamCommand;
@@ -332,8 +353,8 @@ private:
 	void refresh_server_properties();
 
 	Status m_serverStatus{Status::Stopped};
-	bool m_capSysNice{};
 	bool m_headsetConnected{};
+	bool m_sessionRunning{};
 	QString m_jsonConfiguration{};
 
 	QString m_pin{};
@@ -353,12 +374,13 @@ private:
 	int m_speakerChannels{};
 	int m_speakerSampleRate{};
 	QStringList m_supportedCodecs{};
+	QString m_systemName{};
 	QString m_steamCommand{};
 
 Q_SIGNALS:
 	void serverStatusChanged(Status);
-	void capSysNiceChanged(bool);
 	void headsetConnectedChanged(bool);
+	void sessionRunningChanged(bool);
 	void jsonConfigurationChanged(QString);
 	void needMonadoVulkanLayerChanged(bool);
 	void pinChanged(QString);
@@ -379,5 +401,7 @@ Q_SIGNALS:
 	void speakerSampleRateChanged(int);
 	void supportedCodecsChanged(QStringList);
 	void steamCommandChanged(QString);
+	void systemNameChanged(QString);
 	void serverLogsChanged(QString);
+	void serverError(serverErrorData);
 };

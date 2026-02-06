@@ -20,6 +20,7 @@
 #pragma once
 
 #include "utils/handle.h"
+#include "utils/thread_safe.h"
 #include <span>
 #include <string>
 #include <vector>
@@ -39,10 +40,17 @@ class session : public utils::handle<XrSession, xrDestroySession>
 {
 	instance * inst = nullptr;
 	xr::passthrough passthrough;
+	thread_safe<vk::raii::Queue> * queue = nullptr;
+
+	PFN_xrGetDisplayRefreshRateFB xrGetDisplayRefreshRateFB = nullptr;
+	PFN_xrEnumerateDisplayRefreshRatesFB xrEnumerateDisplayRefreshRatesFB = nullptr;
+	PFN_xrRequestDisplayRefreshRateFB xrRequestDisplayRefreshRateFB = nullptr;
+
+	PFN_xrPerfSettingsSetPerformanceLevelEXT xrPerfSettingsSetPerformanceLevelEXT = nullptr;
 
 public:
 	session() = default;
-	session(instance &, system &, vk::raii::Instance &, vk::raii::PhysicalDevice &, vk::raii::Device &, int queue_family_index);
+	session(instance &, system &, vk::raii::Instance &, vk::raii::PhysicalDevice &, vk::raii::Device &, thread_safe<vk::raii::Queue> & queue, int queue_family_index);
 
 	std::vector<XrReferenceSpaceType> get_reference_spaces() const;
 	space create_reference_space(XrReferenceSpaceType ref, const XrPosef & pose = {{0, 0, 0, 1}, {0, 0, 0}});
@@ -89,5 +97,7 @@ public:
 	{
 		return passthrough;
 	}
+
+	void set_performance_level(XrPerfSettingsDomainEXT, XrPerfSettingsLevelEXT);
 };
 } // namespace xr

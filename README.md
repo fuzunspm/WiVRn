@@ -6,7 +6,7 @@
 
 WiVRn wirelessly connects a standalone VR headset to a Linux computer. You can then play PCVR games on the headset while processing is done on the computer.
 
-It supports a wide range of headsets such as Quest 1 / 2 / Pro / 3 / 3S, Pico Neo 4, HTC Vive Focus 3, HTC Vive XR elite and most other Android based headsets.
+It supports a wide range of headsets such as Quest 1 / 2 / Pro / 3 / 3S, Pico Neo 3, Pico 4, HTC Vive Focus 3, HTC Vive XR elite and most other Android based headsets.
 
 # Getting started
 
@@ -41,46 +41,48 @@ Avahi must be running:
 systemctl enable --now avahi-daemon
 ```
 
-If a firewall is installed, open port 5353/UDP for avahi.
-Open ports 9757/UDP+TCP for WiVRn itself.
+- If a firewall is installed, open port 5353/UDP for avahi and ports 9757/UDP+TCP for WiVRn itself.
+- In the case of ufw, use `ufw allow 5353/udp` and `ufw allow 9757`.
 
 ### Running
 - On your computer, run "WiVRn server" application, or `wivrn-dashboard`  from the command line, it will show the connection wizard the first time you launch it.
 - On your headset, run WiVRn from the App Library. If you are using a Quest and you have installed it from an APK instead of the Meta Store, it will be in the "unknown sources" section.
 - You should now see your computer in the list: click connect, the screen will show "Connection ready. Start a VR application on **your computer's name**".
 
-You can now start an OpenXR application on your computer. For Steam games, you will also need to set the launch options to be able to use WiVRn:
+You can now start an OpenXR application on your computer. For Steam games, you may also need to set the launch options to be able to use WiVRn. If nothing related to Steam is displayed in the dashboard or wivrn-server output, then your system does not require it.
 - Right-click on the game you want to play in VR in Steam and click "Properties".
 - In the "General" tab, set the launch options to the value given in the dashboard.
 
 You can set an application to be started automatically when you connect your headset in the dashboard settings or [manually](docs/configuration.md#application)
 
+### Application list
+When the headset is connected and no XR application is running, it will show an application launcher. Applications in that list are sourced from:
+- Steam games that are flagged as VR. Steam may need to be restarted for the list to be updated when new games are installed.
+- .desktop files that contain `X-WiVRn-VR` in the `Categories` section. Files are searched in [standard locations](https://specifications.freedesktop.org/desktop-entry/latest/file-naming.html#desktop-file-id) which usually include `~/.local/share/applications` and `/usr/share/applications/`.
+
 ### OpenVR and Steam games
 
-The flatpak also includes [OpenComposite](https://gitlab.com/znixian/OpenOVR/), used to translate the OpenVR API used by SteamVR to OpenXR used by WiVRn, see [SteamVR](docs/steamvr.md) for details.
+The flatpak also includes [OpenComposite](https://gitlab.com/znixian/OpenOVR/) and [xrizer](https://github.com/Supreeeme/xrizer/), used to translate the OpenVR API used by SteamVR to OpenXR used by WiVRn, see [SteamVR](docs/steamvr.md) for details.
 
-If using Wine/Proton, it will probe for OpenVR at startup, so even for OpenXR applications, OpenComposite is required.
+If using Wine/Proton, it will probe for OpenVR at startup, so even for OpenXR applications, OpenComposite or xrizer is required.
 
-When you start the server through flatpak, it will automatically configure the current OpenVR to use OpenComposite.
+When you start the server through flatpak, it will automatically configure the current OpenVR to use xrizer.
 
 ### Steam Flatpak
 
 If you're using the Steam Flatpak, you'll need to grant read only access to the following paths:
 
 ```bash
-flatpak override --user \
+flatpak override \
   --filesystem=xdg-run/wivrn:ro \
   --filesystem=xdg-data/flatpak/app/io.github.wivrn.wivrn:ro \
+  --filesystem=/var/lib/flatpak/app/io.github.wivrn.wivrn:ro \
   --filesystem=xdg-config/openxr:ro \
   --filesystem=xdg-config/openvr:ro \
   com.valvesoftware.Steam
 ```
 
-Then create a symlink for the OpenXR configuration file (the directory `~/.var/app/com.valvesoftware.Steam/.config/openxr` will need to be created if it doesn't already exist):
-
-```bash
-ln -s ~/.config/openxr/1 ~/.var/app/com.valvesoftware.Steam/.config/openxr/1
-```
+When using a user installation of flatpak Steam, user `override --user` instead of `override`.
 
 ### Audio
 When the headset is connected, WiVRn will create a virtual output device named WiVRn. It is not selected as default and you should either assign the application to the device when it is running, or mark it as default. To do so you can use `pavucontrol` or your desktop environment's configuration panel. Please note that in `pavucontrol` it will appear as a virtual device.
@@ -109,7 +111,7 @@ If the server list is empty in the headset app:
 
 ## My headset does not connect to my computer
 - If you have a firewall, check that port 9757 (UDP and TCP) is open
-- The server and client must be compatible:
+- The server and client must be compatible.
 
 ## How do I use a wired connection?
 
@@ -129,9 +131,20 @@ If the server list is empty in the headset app:
 
 ## How do I see server logs when using the dashboard?
 
-```
-journalctl -f --no-hostname -u io.github.wivrn.wivrn.desktop
-```
+- Click Troubleshoot > Open server logs, or
+- Navigate to `${XDG_STATE_HOME}/wivrn/wivrn-dashboard` (with fallback to `${HOME}/.local/state` for `${XDG_STATE_HOME}`, or
+- For flatpak, navigate to `${HOME}/.var/app/io.github.wivrn.wivrn/.local/state/wivrn/wivrn-dashboard`.
+
+## I have high motion latency, black borders following my view, hear corrupted audio or see a corrupted, pixelated image
+
+- When connecting through USB, make sure the headset isn't connected through WiFi (switch off WiFi)
+- Reset the settings using the button at the bottom of the settings tab
+- Try switching to software encoding
+- Decrease the bitrate
+- Decrease the resolution in the WiVRn app
+- Connect through USB or use a better WiFi router.
+
+Note: WiVRn isn't properly optimized for NVIDIA GPUs due to the lack of developers with NVIDIA hardware. Motion latency may be significantly worse at rendering resolutions higher than default.
 
 # Contributing
 
@@ -155,7 +168,7 @@ WiVRn uses the following software:
 - [HarfBuzz](https://harfbuzz.github.io/)
 - [librsvg](https://wiki.gnome.org/Projects/LibRsvg)
 - [Monado](https://monado.freedesktop.org/)
-- [nvenc](https://developer.nvidia.com/nvidia-video-codec-sdk) optional, for hardware encoding on Nvidia
+- [nvenc](https://developer.nvidia.com/nvidia-video-codec-sdk) optional, for hardware encoding on NVIDIA
 - [qCoro](https://qcoro.dev/)
 - [Qt 6](https://www.qt.io/) optional, for the dashboard
 - [spdlog](https://github.com/gabime/spdlog)
