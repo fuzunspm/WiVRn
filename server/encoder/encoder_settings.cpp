@@ -19,6 +19,7 @@
 #include "encoder_settings.h"
 
 #include "driver/configuration.h"
+#include "driver/wivrn_comp_target.h"
 #include "util/u_logging.h"
 #include "utils/wivrn_vk_bundle.h"
 #include "video_encoder.h"
@@ -26,7 +27,7 @@
 #include "wivrn_packets.h"
 #include <magic_enum.hpp>
 #include <string>
-#include <vulkan/vulkan.h>
+#include <vulkan/vulkan.hpp>
 
 #include "wivrn_config.h"
 
@@ -178,7 +179,7 @@ class prober
 	}
 #endif
 
-	static bool is_nvidia(vk::PhysicalDevice physical_device)
+	static bool is_nvidia(vk::raii::PhysicalDevice & physical_device)
 	{
 		auto props = physical_device.getProperties();
 		return props.vendorID == 0x10DE;
@@ -211,7 +212,7 @@ class prober
 
 public:
 	prober(wivrn_vk_bundle & vk, const from_headset::headset_info_packet & info) :
-	        vk(vk), info(info), nvidia(is_nvidia(*vk.physical_device)) {}
+	        vk(vk), info(info), nvidia(is_nvidia(vk.physical_device)) {}
 
 	std::pair<std::string, video_codec> select_encoder(const configuration::encoder & config)
 	{
@@ -294,7 +295,7 @@ std::array<encoder_settings, 3> get_encoder_settings(wivrn_vk_bundle & bundle, c
 
 	for (auto [src, dst]: std::ranges::zip_view(config.encoders, res))
 	{
-		dst.fps = settings.preferred_refresh_rate;
+		dst.fps = get_default_rate(info, settings);
 		dst.options = src.options;
 		dst.device = src.device;
 
@@ -328,7 +329,7 @@ std::array<encoder_settings, 3> get_encoder_settings(wivrn_vk_bundle & bundle, c
 	if (std::ranges::contains(res, video_codec::h264, &encoder_settings::codec) or
 	    std::ranges::contains(res, video_codec::raw, &encoder_settings::codec))
 		bit_depth = 8;
-	else
+	else if (not bit_depth)
 		bit_depth = 10;
 
 	auto check_format = [&](vk::Format format) {
@@ -350,7 +351,42 @@ std::array<encoder_settings, 3> get_encoder_settings(wivrn_vk_bundle & bundle, c
 		}
 	};
 
-	if (bit_depth == 10 and not check_format(vk::Format::eR10X6UnormPack16))
+#if WIVRN_USE_VAAPI
+	auto check_vaapi = [&](int bit_depth) {
+		for (const auto & encoder: res)
+		{
+			if (encoder.encoder_name == encoder_vaapi)
+			{
+				try
+				{
+					video_encoder_va{
+					        bundle,
+					        encoder_settings{
+					                .width = 800,
+					                .height = 800,
+					                .codec = encoder.codec,
+					                .fps = 60,
+					                .bitrate = 50'000'000,
+					                .bit_depth = bit_depth,
+					        },
+					        0};
+				}
+				catch (std::exception & e)
+				{
+					U_LOG_I("vaapi not supported for %s %d bits", std::string(magic_enum::enum_name(encoder.codec)).c_str(), bit_depth);
+					return false;
+				}
+			}
+		}
+		return true;
+	};
+#else
+	auto check_vaapi = [&](int) {
+		return true;
+	};
+#endif
+
+	if (bit_depth == 10 and not(check_format(vk::Format::eR16Unorm) and check_vaapi(*bit_depth)))
 	{
 		U_LOG_W("GPU does not have sufficient support for 10-bit images, reverting to 8");
 		bit_depth = 8;
